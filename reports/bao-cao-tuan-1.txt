@@ -1,0 +1,318 @@
+===============================================================================
+                        BÁO CÁO TIẾN ĐỘ TUẦN 1
+                    (Tuần 1: từ ..../..../.... đến ..../..../....)
+===============================================================================
+
+Họ và tên       : ........................................................
+Mã số sinh viên : ........................................................
+Lớp / Nhóm      : ........................................................
+Giảng viên HD   : ........................................................
+Ngày nộp        : ..../..../....
+
+-------------------------------------------------------------------------------
+1. TÊN ĐỀ TÀI
+-------------------------------------------------------------------------------
+
+Xây dựng website mã hoá và chia sẻ tài liệu, bí mật phía máy khách
+(Zero-Knowledge Secure Vault).
+
+Mô tả ngắn: Người dùng nhập một đoạn văn bản (hoặc tải lên một tệp); nội dung
+được mã hoá ngay trên trình duyệt trước khi gửi đi, hệ thống trả về một "key".
+Chỉ người giữ key mới đọc lại được nội dung. Máy chủ chỉ lưu bản mã, không có
+khả năng giải mã kể cả khi toàn bộ dữ liệu của máy chủ bị lộ.
+
+-------------------------------------------------------------------------------
+2. MỤC TIÊU CỦA TUẦN
+-------------------------------------------------------------------------------
+
+Tuần 1 là tuần nghiên cứu, chưa cài đặt. Mục tiêu đặt ra:
+
+  (1) Hiểu nguyên lý mã hoá đối xứng hiện đại, phân biệt được các chế độ hoạt
+      động và chọn được một chế độ phù hợp cho bài toán.
+  (2) Hiểu cơ chế dẫn xuất khoá (KDF), cụ thể là HKDF, và vai trò của nó khi
+      hệ thống chỉ có duy nhất một khoá do người dùng giữ.
+  (3) Hiểu chính xác mô hình "zero-knowledge" và cơ chế cấp quyền bằng khoá
+      (capability), từ đó xác định được giới hạn bảo mật của sản phẩm.
+  (4) Khảo sát các giải pháp đã có để rút ra bài học, và chốt bộ công nghệ
+      cho giai đoạn cài đặt ở tuần sau.
+
+-------------------------------------------------------------------------------
+3. NỘI DUNG THỰC HIỆN
+-------------------------------------------------------------------------------
+
+3.1. Mã hoá đối xứng và AES
+    Đã tìm hiểu:
+      - AES (FIPS 197) là mã khối, xử lý từng khối 128 bit, khoá dài
+        128/192/256 bit tương ứng 10/12/14 vòng biến đổi.
+      - Mỗi vòng gồm bốn phép: SubBytes (thay thế phi tuyến), ShiftRows
+        (hoán vị), MixColumns (khuếch tán), AddRoundKey (trộn khoá vòng).
+      - Bản thân AES chỉ là một phép biến đổi trên 16 byte; để mã hoá dữ liệu
+        dài hơn buộc phải dùng "chế độ hoạt động" (mode of operation).
+
+    Rút ra: chọn được AES chưa đủ, phần lớn lỗi bảo mật thực tế nằm ở chế độ
+    hoạt động và ở cách quản lý IV.
+
+3.2. Các chế độ hoạt động (ECB, CBC, CTR, GCM)
+    Đã tìm hiểu:
+      - ECB: mỗi khối mã hoá độc lập, nên hai khối bản rõ giống nhau cho ra
+        hai khối bản mã giống nhau, làm lộ cấu trúc dữ liệu.
+      - CBC: khối trước được trộn vào khối sau, cần IV ngẫu nhiên và cần
+        padding; nếu phía giải mã báo lỗi padding khác nhau thì có thể bị lợi
+        dụng (padding oracle).
+      - CTR: biến AES thành bộ sinh dòng khoá, XOR với bản rõ; không cần
+        padding, song song hoá được, nhưng không phát hiện được sửa đổi.
+      - GCM: kết hợp CTR để mã hoá và GHASH để tính thẻ xác thực.
+
+    Rút ra: ECB và CBC bị loại; CTR chỉ an toàn khi có thêm cơ chế xác thực
+    riêng; GCM là lựa chọn gọn nhất vì vừa mã hoá vừa xác thực.
+
+3.3. Mã hoá có xác thực — AES-GCM (NIST SP 800-38D)
+    Đã tìm hiểu:
+      - GCM (Galois/Counter Mode) là AEAD: nhận vào khoá, nonce (IV), bản rõ
+        và dữ liệu xác thực bổ sung (AAD); trả ra bản mã và thẻ xác thực.
+      - Nonce kích thước khuyến nghị là 96 bit; thẻ xác thực 128 bit.
+      - AAD là dữ liệu được bảo vệ tính toàn vẹn nhưng không bị mã hoá
+        (ví dụ: số phiên bản định dạng, định danh tệp).
+      - Quy tắc bắt buộc: KHÔNG BAO GIỜ tái sử dụng cặp (khoá, nonce). Nếu
+        tái sử dụng, kẻ tấn công lấy được XOR của hai bản rõ và có thể phục
+        hồi khoá xác thực GHASH.
+
+    Rút ra: sinh nonce ngẫu nhiên cho mỗi lần mã hoá; nonce phải nằm trong
+    gói tin để phía nhận dùng lại; sai sót về nonce là lỗi nghiêm trọng nhất
+    của hệ thống dùng GCM.
+
+3.4. Dẫn xuất khoá bằng HKDF (RFC 5869)
+    Đã tìm hiểu:
+      - HKDF gồm hai pha: Extract (PRK = HMAC(salt, khoá gốc) — nén nguyên
+        liệu khoá về độ dài cố định) và Expand (sinh ra khoá có độ dài mong
+        muốn từ PRK, kèm tham số "info").
+      - Nhờ tham số "info" khác nhau, cùng một khoá gốc có thể sinh ra nhiều
+        khoá độc lập, không suy ra được nhau.
+      - Nguyên tắc "một khoá không dùng cho hai mục đích" là yêu cầu chuẩn
+        trong các khuyến nghị về quản lý khoá.
+
+    Rút ra: từ một key 32 byte do người dùng giữ, có thể sinh ra khoá mã hoá,
+    khoá dùng để chứng thực với máy chủ và một định danh, mà lộ một nhánh
+    không làm lộ các nhánh còn lại.
+
+3.5. Mô hình zero-knowledge và cơ chế cấp quyền bằng khoá
+    Đã tìm hiểu:
+      - "Zero-knowledge" ở đây được hiểu chính xác là: máy chủ không có
+        phương tiện để giải mã (không giữ khoá), chứ không phải "máy chủ cam
+        kết không xem".
+      - Cơ chế capability: quyền truy cập gắn với "vật mình có" (key) thay vì
+        "điều mình biết" (mật khẩu). Nhờ vậy không cần tài khoản, không có
+        cơ sở dữ liệu người dùng để rò rỉ.
+      - Để máy chủ tra cứu được mà không biết khoá, ta cho máy chủ một giá
+        trị băm một chiều của khoá; máy chủ không thể đảo ngược để tìm khoá.
+      - Hai hệ quả phải chấp nhận: mất key là mất dữ liệu vĩnh viễn; ai có
+        key là đọc được nội dung.
+
+    Rút ra: bảo mật của sản phẩm đặt trọn vào việc bảo vệ chuỗi key, nên
+    phần giao diện phải cảnh báo rõ và phần máy chủ phải hạn chế lộ metadata.
+
+3.6. Khảo sát các giải pháp cùng loại
+    Đã tìm hiểu:
+      - Firefox Send: mã hoá ngay trên trình duyệt, khoá nằm sau dấu # của
+        liên kết (không gửi lên máy chủ), có thời hạn và giới hạn số lần tải.
+        Dịch vụ bị đóng năm 2020 sau khi bị lạm dụng để phát tán mã độc.
+      - magic-wormhole: truyền tệp trực tiếp giữa hai máy, mã hoá bằng một
+        cụm từ ngắn; hai bên phải online cùng lúc.
+      - age: công cụ mã hoá tệp với định dạng đơn giản, có số phiên bản và
+        phần đầu được xác thực; dùng X25519 và ChaCha20-Poly1305.
+      - Bitwarden Send: mã hoá phía máy khách, có thời hạn, giới hạn lượt
+        xem và tuỳ chọn thêm mật khẩu cho người nhận.
+
+    Rút ra: bảo mật kỹ thuật tốt vẫn có thể thất bại nếu thiếu kiểm soát lạm
+    dụng. Vì vậy ngay từ đầu phải có thời hạn lưu trữ, giới hạn dung lượng và
+    giới hạn tần suất gửi.
+
+3.7. Nền tảng thực thi — Web Crypto API
+    Đã tìm hiểu:
+      - crypto.subtle chỉ khả dụng trong "secure context" (HTTPS hoặc
+        localhost); mở bằng file:// sẽ không có API này.
+      - crypto.getRandomValues là bộ sinh số ngẫu nhiên mật mã; không được
+        dùng Math.random cho bất kỳ giá trị bí mật nào.
+      - Trình duyệt đã hỗ trợ sẵn AES-GCM và HKDF, nên không cần thư viện
+        ngoài — giảm rủi ro chuỗi cung ứng phần mềm.
+
+    Rút ra: chốt được nền tảng chạy thử là trình duyệt, phía máy chủ dùng
+    Node.js nhằm đồng nhất ngôn ngữ với phía máy khách.
+
+3.8. Định dạng khoá cho người dùng
+    Đã tìm hiểu:
+      - Base64URL có các cặp ký tự dễ nhầm khi chép tay hoặc đọc qua điện
+        thoại: 0 với O, 1 với l/I.
+      - Crockford Base32 dùng 32 ký tự và loại bỏ I, L, O, U, phù hợp cho
+        chuỗi dài mà người dùng phải chép lại.
+      - Thêm một đoạn checksum ngắn giúp phát hiện lỗi gõ sai ngay trên máy
+        khách, trước khi gửi yêu cầu lên máy chủ.
+
+    Rút ra: khoá dùng cho người dùng không nên là Base64 thô, mà nên là
+    Base32 có checksum, chia nhóm để dễ đọc.
+
+-------------------------------------------------------------------------------
+4. KẾT QUẢ ĐẠT ĐƯỢC
+-------------------------------------------------------------------------------
+
+  4.1. Đã tìm hiểu (chưa cài đặt) toàn bộ chuỗi lý thuyết cần thiết: AES và
+       các chế độ hoạt động, AEAD/GCM, HKDF, mô hình zero-knowledge và cơ
+       chế capability, cơ chế sinh số ngẫu nhiên mật mã, định dạng khoá.
+
+  4.2. Đã chốt thuật toán sử dụng: AES-256-GCM. Lý do loại các phương án
+       khác được trình bày ở Bảng 2 và Bảng 3.
+
+  4.3. Đã chốt mô hình khoá: chỉ một khoá do người dùng giữ; từ khoá này dẫn
+       xuất ra ba giá trị độc lập bằng HKDF — khoá mã hoá (không gửi đi),
+       khoá chứng thực (gửi máy chủ) và định danh (dùng tra cứu).
+
+  4.4. Đã xác định ba ràng buộc thiết kế bắt buộc:
+       (a) nonce 96 bit sinh ngẫu nhiên cho mỗi lần mã hoá, không tái sử dụng;
+       (b) không dùng cùng một khoá cho cả mã hoá và xác thực;
+       (c) máy chủ phải có thời hạn lưu trữ và giới hạn dung lượng ngay từ
+           phiên bản đầu tiên.
+
+  4.5. Đã chốt bộ công nghệ dự kiến cho giai đoạn cài đặt:
+       - Phía máy khách: Web Crypto API (AES-GCM, HKDF), không dùng thư viện
+         mã hoá bên thứ ba.
+       - Phía máy chủ: Node.js, cơ sở dữ liệu SQLite.
+       - Truyền thông: HTTPS.
+
+-------------------------------------------------------------------------------
+5. MINH CHỨNG KẾT QUẢ
+-------------------------------------------------------------------------------
+
+Bảng 1. Tổng hợp tài liệu đã đọc
+
+  STT | Tài liệu                                  | Rút ra được gì
+  ----+-------------------------------------------+-------------------------
+   1  | FIPS 197 — Advanced Encryption Standard   | Cấu trúc AES, kích
+      | (NIST, 2001)                              | thước khối và khoá
+   2  | NIST SP 800-38D — Recommendation for      | GCM = CTR + GHASH; quy
+      | Block Cipher Modes of Operation: GCM      | tắc nonce; vai trò AAD
+   3  | RFC 5869 — HKDF                            | Extract/Expand; tham
+      |                                           | số info tách nhánh khoá
+   4  | RFC 2104 — HMAC                            | Cơ sở cho cả PRK của
+      |                                           | HKDF và thẻ xác thực
+   5  | RFC 8439 — ChaCha20 and Poly1305          | Phương án AEAD so sánh
+   6  | OWASP — Cryptographic Storage Cheat Sheet | Không tái dùng khoá cho
+      |                                           | nhiều mục đích
+   7  | MDN — Web Crypto API                      | Secure context,
+      |                                           | getRandomValues, subtle
+   8  | Tài liệu/Blog về việc Firefox Send đóng   | Bài học về lạm dụng
+      | cửa năm 2020                              | dịch vụ lưu trữ ẩn danh
+
+Bảng 2. So sánh các chế độ hoạt động của AES
+
+  Tiêu chí              | ECB      | CBC       | CTR        | GCM
+  ----------------------+----------+-----------+------------+-------------
+  Che giấu mẫu dữ liệu  | Không    | Có        | Có         | Có
+  Cần padding           | Có       | Có        | Không      | Không
+  Tự xác thực dữ liệu   | Không    | Không     | Không      | Có (thẻ 128b)
+  Chống sửa đổi         | Không    | Không     | Không      | Có
+  Song song hoá         | Có       | Chỉ giải mã| Có        | Có
+  Kết luận              | Loại     | Loại      | Cần MAC kèm| CHỌN
+
+Bảng 3. So sánh các thuật toán AEAD
+
+  Thuật toán          | Ưu điểm                    | Hạn chế             | KL
+  --------------------+----------------------------+---------------------+-----
+  AES-256-GCM         | Có tăng tốc phần cứng      | Nonce lặp là thảm   | CHỌN
+                      | (AES-NI); chuẩn phổ biến   | hoạ; cần kỷ luật IV |
+                      | Web Crypto hỗ trợ sẵn      |                     |
+  ChaCha20-Poly1305   | Nhanh trên thiết bị không  | Không tận dụng      | Dự
+                      | có AES-NI; an toàn hơn khi | AES-NI trên x86     | phòng
+                      | dùng nonce ngẫu nhiên       |                     |
+  AES-CBC + HMAC      | Phổ biến trong hệ thống cũ | Phải tự ghép đúng   | Loại
+                      |                            | thứ tự mã hoá/xác   |
+                      |                            | thực, dễ sai        |
+
+Bảng 4. So sánh các giải pháp tham khảo
+
+  Giải pháp        | Mô hình                        | Bài học rút ra
+  -----------------+--------------------------------+------------------------
+  Firefox Send     | Mã hoá tại client, khoá nằm    | Đóng cửa 2020 vì bị lạm
+                   | sau dấu #, có TTL và giới hạn  | dụng; phải có kiểm soát
+                   | số lần tải                    | từ đầu
+  magic-wormhole   | Truyền trực tiếp P2P, mã hoá   | Không cần lưu trữ nhưng
+                   | bằng cụm từ ngắn               | hai bên phải online cùng lúc
+  age              | Định dạng tệp có version,      | Header tối giản và có
+                   | X25519 + ChaCha20-Poly1305     | version là thiết kế tốt
+  Bitwarden Send   | Mã hoá tại client, TTL, tuỳ    | Có thể kết hợp thêm một
+                   | chọn mật khẩu, giới hạn lượt   | lớp mật khẩu cho người nhận
+
+(Ghi chú: các bảng trên là bản tóm tắt; khi nộp có thể trình bày lại dưới dạng
+bảng trong Word.)
+
+-------------------------------------------------------------------------------
+6. KHÓ KHĂN (NẾU CÓ)
+-------------------------------------------------------------------------------
+
+  6.1. Phần toán của GHASH (phép nhân trong trường hữu hạn GF(2^128)) khó nắm
+       trọn vẹn. Hiện mới hiểu được vai trò và cách sử dụng của thẻ xác thực,
+       chưa tự cài đặt được phần tính thẻ.
+
+  6.2. Các tài liệu chuẩn (NIST, RFC) bằng tiếng Anh và khá dài; phải chọn
+       đọc các chương liên quan thay vì đọc toàn bộ, mất nhiều thời gian.
+
+  6.3. Môi trường phát triển chưa sẵn sàng: máy chưa cài Node.js, quá trình
+       cài đặt gặp lỗi do registry còn sót đường dẫn của một bản cài cũ trên
+       ổ đĩa không còn tồn tại. Đã khắc phục bằng cách cài qua trình quản lý
+       phiên bản Node (fnm) và kiểm tra lại với Node 24.
+
+-------------------------------------------------------------------------------
+7. KẾ HOẠCH TUẦN TIẾP THEO
+-------------------------------------------------------------------------------
+
+  STT | Công việc                                   | Đầu ra kiểm chứng được
+  ----+---------------------------------------------+-----------------------
+   1  | Dựng trang mã hoá/giải mã văn bản chạy trên  | Mở trên trình duyệt,
+      | trình duyệt bằng Web Crypto API              | nhập văn bản, nhận
+      |                                              | được bản mã và khoá
+   2  | Thiết kế định dạng gói tin: phiên bản,       | Bản đặc tả một trang,
+      | nonce, bản mã, thẻ xác thực                  | có vẽ sơ đồ byte
+   3  | Viết module dẫn xuất khoá bằng HKDF (sinh    | Hàm chạy được, in ra
+      | khoá mã hoá, khoá chứng thực, định danh) và  | khoá dạng ZKV1-...
+      | định dạng khoá Base32 + checksum             |
+   4  | Kiểm thử tính đúng đắn: sai khoá, sửa 1 bit  | Bộ kiểm thử tự động,
+      | trong bản mã, khoá gõ sai chính tả           | tất cả đều đạt
+   5  | Viết báo cáo tuần 2 và chuẩn bị nội dung demo| Báo cáo + kịch bản demo
+
+-------------------------------------------------------------------------------
+8. TÀI LIỆU THAM KHẢO
+-------------------------------------------------------------------------------
+
+  1. NIST (2001). FIPS PUB 197 — Advanced Encryption Standard (AES).
+  2. NIST (2007). SP 800-38D — Recommendation for Block Cipher Modes of
+     Operation: Galois/Counter Mode (GCM) and GMAC.
+  3. Krawczyk, H., Eronen, P. (2010). RFC 5869 — HMAC-based Extract-and-Expand
+     Key Derivation Function (HKDF).
+  4. Krawczyk, H., Bellare, M., Canetti, R. (1997). RFC 2104 — HMAC:
+     Keyed-Hashing for Message Authentication.
+  5. Nir, Y., Langley, A. (2017). RFC 8439 — ChaCha20 and Poly1305 for IETF
+     Protocols.
+  6. OWASP. Cryptographic Storage Cheat Sheet.
+  7. MDN Web Docs. Web Crypto API.
+  8. Crockford, D. Base 32 — a 32-character subset of Unicode.
+
+===============================================================================
+          GHI CHÚ DÀNH CHO NGƯỜI VIẾT (xoá phần này trước khi nộp)
+===============================================================================
+
+1. Điền thông tin cá nhân ở đầu báo cáo.
+
+2. Tuần này cố ý KHÔNG đưa phần cài đặt vào, dù code đã có. Giữ giai đoạn
+   cài đặt cho tuần 2 để có nội dung báo cáo tiếp theo và để câu chuyện tiến
+   độ hợp lý hơn.
+
+3. Khi chuyển sang Word: dùng Times New Roman 13, giãn dòng 1.5, mục 5 đổi
+   các bảng văn bản thành bảng thật trong Word.
+
+4. Không cần thêm ảnh chụp màn hình ở tuần này vì chưa có sản phẩm. Bảng và
+   danh mục tài liệu là minh chứng phù hợp cho tuần nghiên cứu.
+
+5. Nếu thầy hỏi "đã làm được gì", trả lời: đã chốt được thuật toán, mô hình
+   khoá và bộ công nghệ; phần cài đặt bắt đầu tuần sau.
+
+6. Có thể rút ngắn nếu thầy yêu cầu 2 trang: giữ lại 1, 2, 4, 5 (Bảng 1 và
+   Bảng 2), 7; lược bớt phần mô tả chi tiết ở mục 3.
