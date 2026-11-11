@@ -84,7 +84,12 @@
         const fromBase64Url = (str) => {
             let b64 = str.replace(/-/g, '+').replace(/_/g, '/');
             while (b64.length % 4) b64 += '=';
-            return Uint8Array.from(atob(b64), c => c.charCodeAt(0)).buffer;
+            const buf = Uint8Array.from(atob(b64), c => c.charCodeAt(0)).buffer;
+            // Kiểm tra nghiêm ngặt: nếu chuỗi truyền vào khác với chuỗi chuẩn hóa từ buffer thì báo lỗi
+            if (toBase64Url(buf) !== str) {
+                throw new Error('Non-canonical Base64URL string (unused bits modified)');
+            }
+            return buf;
         };
 
         async function encryptText() {
