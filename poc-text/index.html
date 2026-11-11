@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="vi">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="referrer" content="no-referrer">
+    <title>ZK-Vault PoC — gửi văn bản bằng key</title>
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+    <link rel="stylesheet" href="/poc-text/style.css">
+</head>
+
+<body>
+    <main class="wrap">
+
+        <header class="hero">
+            <div class="brand">ZK-VAULT · PoC</div>
+            <h1>Gửi văn bản bằng một key</h1>
+            <p>Nhập đoạn text (tối đa 200 từ) → nhận một key → dán key để lấy lại văn bản.
+                Server chỉ lưu bản mã, không đọc được nội dung.</p>
+        </header>
+
+        <div class="grid">
+
+            <!-- ============ GỬI ============ -->
+            <section class="card">
+                <h2><span class="num">1</span> Gửi văn bản</h2>
+
+                <textarea id="plain" spellcheck="false" rows="7"
+                    placeholder="Dán đoạn văn bản cần gửi ở đây..."></textarea>
+
+                <div class="row">
+                    <span class="counter" id="counter">0/200 từ</span>
+                    <button class="primary" id="send" disabled>Mã hoá &amp; lưu</button>
+                </div>
+
+                <p class="msg" id="sendMsg" hidden></p>
+
+                <div class="keybox" id="keyBox" hidden>
+                    <div class="label">Key gửi cho người nhận</div>
+                    <div class="key" id="keyOut"></div>
+                    <div class="row">
+                        <button class="ghost" id="copyBtn" type="button">Copy key</button>
+                        <button class="ghost" id="tryBtn" type="button">Thử mở ngay →</button>
+                    </div>
+                </div>
+            </section>
+
+            <!-- ============ NHẬN ============ -->
+            <section class="card">
+                <h2><span class="num">2</span> Nhận văn bản</h2>
+
+                <label class="label" for="keyIn">Dán key vào đây</label>
+                <textarea id="keyIn" class="key-input" rows="2" spellcheck="false" autocomplete="off"
+                    placeholder="ZKV1-XXXX-XXXX-..."></textarea>
+
+                <p class="msg" id="recvMsg" hidden></p>
+
+                <div class="result" id="result" hidden>
+                    <div class="label">Văn bản gốc</div>
+                    <div class="text" id="textOut"></div>
+                </div>
+            </section>
+
+        </div>
+
+        <footer class="footer">
+            AES-256-GCM chạy trong trình duyệt · khoá không bao giờ gửi lên server ·
+            server chỉ giữ bản mã và không biết nội dung
+        </footer>
+
+    </main>
+
+    <script src="/crypto.js"></script>
+    <script src="/keycode.js"></script>
+    <script src="/poc-text/app.js"></script>
+</body>
+
+</html>

@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="vi">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="referrer" content="no-referrer">
+    <title>ZK-Vault — gửi tệp bằng key, không cần đăng nhập</title>
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+    <link rel="stylesheet" href="/style.css">
+</head>
+
+<body>
+    <div class="wrap">
+
+        <header class="hero">
+            <div class="logo">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                    stroke-linejoin="round" aria-hidden="true">
+                    <rect x="3" y="11" width="18" height="11" rx="2"></rect>
+                    <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
+                </svg>
+                ZK-VAULT
+            </div>
+            <h1>Tệp của bạn được mã hoá trước khi rời khỏi máy</h1>
+            <p><span class="dot"></span>Không tài khoản, không mật khẩu. Bạn giữ một key —
+                và chỉ key đó mở được tệp.</p>
+        </header>
+
+        <div class="tabs" role="tablist">
+            <button role="tab" id="tab-send" aria-selected="true" aria-controls="panel-send">Gửi tệp</button>
+            <button role="tab" id="tab-open" aria-selected="false" aria-controls="panel-open">Mở bằng key</button>
+        </div>
+
+        <!-- ================= GỬI ================= -->
+        <section class="panel" id="panel-send" role="tabpanel" aria-labelledby="tab-send">
+            <div class="card">
+
+                <div class="drop" id="dropZone" tabindex="0" role="button"
+                    aria-label="Chọn hoặc kéo thả tệp cần mã hoá">
+                    <svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="#4338ca" stroke-width="1.7"
+                        stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                        <path d="M12 16V4"></path>
+                        <path d="m7 9 5-5 5 5"></path>
+                        <path d="M20 16v2a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2v-2"></path>
+                    </svg>
+                    <div class="big">Kéo thả tệp vào đây</div>
+                    <div class="small">PDF, ảnh, tài liệu, hoặc bất kỳ tệp nào · tối đa 25 MB</div>
+                    <input type="file" id="fileInput">
+                </div>
+
+                <div id="fileChip" hidden></div>
+
+                <div class="options">
+                    <label>Tệp tồn tại trong
+                        <select id="ttlSelect">
+                            <option value="3600">1 giờ</option>
+                            <option value="86400">1 ngày</option>
+                            <option value="604800" selected>7 ngày</option>
+                        </select>
+                    </label>
+                    <label>
+                        <input type="checkbox" id="burnCheck">
+                        Chỉ cho tải 1 lần rồi tự huỷ
+                    </label>
+                </div>
+
+                <div class="actions">
+                    <button class="primary" id="sendBtn" disabled>Mã hoá &amp; tải lên</button>
+                    <button class="ghost" id="textToggle" type="button">hoặc gõ văn bản ngay tại đây</button>
+                </div>
+
+                <div id="textWrap" class="mt14" hidden>
+                    <textarea class="key-input plain-text" id="textInput"
+                        placeholder="Dán văn bản, ghi chú, mật khẩu... sẽ được lưu thành một tệp .txt"></textarea>
+                </div>
+
+                <div class="status" id="sendStatus" hidden></div>
+
+                <div class="keybox" id="keyBox" hidden>
+                    <h3>Key của bạn</h3>
+                    <p class="hint">Server không có key này và không có cách nào khôi phục nó.</p>
+                    <div class="key-value" id="keyValue"></div>
+                    <div class="actions mt12">
+                        <button class="primary" id="copyKeyBtn" type="button">Copy key</button>
+                        <button class="secondary" id="openNowBtn" type="button">Mở thử ngay</button>
+                    </div>
+                    <div class="warning">
+                        <span aria-hidden="true">⚠︎</span>
+                        <div><strong>Lưu key này ngay.</strong> Mất key là mất tệp — không có khôi phục, không có
+                            hỗ trợ. Nên dán vào password manager hoặc in ra giấy, đừng gửi qua chat.</div>
+                    </div>
+                </div>
+
+            </div>
+        </section>
+
+        <!-- ================= MỞ ================= -->
+        <section class="panel" id="panel-open" role="tabpanel" aria-labelledby="tab-open" hidden>
+            <div class="card">
+                <label for="keyInput" class="field-label">Dán key của bạn</label>
+                <p class="sub">Dạng <code>ZKV1-XXXX-XXXX-…</code> · gõ sai chính tả sẽ được báo ngay.</p>
+
+                <div class="key-input-wrap">
+                    <textarea class="key-input" id="keyInput" spellcheck="false" autocomplete="off"
+                        placeholder="ZKV1-...."></textarea>
+                </div>
+
+                <div class="actions">
+                    <button class="primary" id="openBtn">Mở khoá &amp; tải tệp</button>
+                    <span class="inline-hint" id="keyHint"></span>
+                </div>
+
+                <div class="status" id="openStatus" hidden></div>
+
+                <div class="result-file" id="resultBox" hidden>
+                    <div class="head">Đã mở khoá</div>
+                    <div class="file-chip chip-white">
+                        <div class="file-icon" id="resultIcon">TỆP</div>
+                        <div>
+                            <div class="name" id="resultName"></div>
+                            <div class="meta" id="resultMeta"></div>
+                        </div>
+                    </div>
+                    <div class="preview" id="resultPreview" hidden></div>
+                    <div class="actions">
+                        <button class="primary" id="downloadBtn">Tải về máy</button>
+                        <button class="secondary" id="deleteBtn" type="button">Xoá khỏi server</button>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <div class="footer">
+            Mã hoá AES-256-GCM chạy trong trình duyệt · <code>encKey</code> không bao giờ gửi lên server ·
+            server chỉ giữ <code>id = SHA-256(authKey)</code>
+        </div>
+
+    </div>
+
+    <script src="/crypto.js"></script>
+    <script src="/keycode.js"></script>
+    <script src="/app.js"></script>
+</body>
+
+</html>

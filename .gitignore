@@ -3,3 +3,7 @@ node_modules/
 __pycache__/
 .env
 .DS_Store
+
+# dữ liệu người dùng chạy server sinh ra — không bao giờ commit
+data/
+_scratch/
