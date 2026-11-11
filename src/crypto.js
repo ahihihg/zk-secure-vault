@@ -1,40 +1,30 @@
 /*!
- * ZK-Vault — lõi mã hoá v2: dẫn xuất khoá + mã hoá tệp theo từng khối.
+ * crypto.js — lõi mã hoá của ZK-Vault.
  *
- * Khác với PoC tuần 1 (một khối GCM cho cả văn bản), bản này chia tệp thành
- * nhiều khối để mã hoá được tệp lớn mà không cần giải mã toàn bộ trong RAM,
- * đồng thời chống được cắt bớt tệp (truncation) và đảo thứ tự khối.
+ * Toàn bộ việc mã hoá diễn ra trên máy người dùng. Server chỉ nhận bản mã.
  *
- * ── TỪ MỘT KEY DUY NHẤT ────────────────────────────────────────────────
+ * ── TỪ MỘT KEY DUY NHẤT SINH RA BA GIÁ TRỊ ──────────────────────────────
  *
- *   K (32 byte, người dùng giữ)
- *    ├─ HKDF-SHA256(K, "zkv1/enc")  -> encKey  32B : AES-256-GCM, KHÔNG rời máy
- *    ├─ HKDF-SHA256(K, "zkv1/auth") -> authKey 32B : gửi server làm Bearer
- *    └─ SHA-256("zkv1/id" ‖ authKey)[0..16] -> id  : server dùng để định vị blob
+ *   K (32 byte, người dùng giữ — chính là "key" ZKV1-…)
+ *    │
+ *    ├─ HKDF-SHA256(K, "zkv1/enc")  → encKey  32B  → AES-256-GCM, KHÔNG rời máy
+ *    ├─ HKDF-SHA256(K, "zkv1/auth") → authKey 32B  → gửi server trong header
+ *    └─ SHA-256("zkv1/id" ‖ authKey)[0..15] → id   → server dùng để tra cứu
  *
- * Server chỉ thấy `id` và `authKey`; không có encKey nên không giải mã được,
- * và vì id là ảnh một chiều của authKey nên biết id cũng không tải được blob.
+ * Server nhận `id` và `authKey`, KHÔNG BAO GIỜ nhận `encKey` hay `K`.
+ * Vì `id` là ảnh một chiều của authKey nên biết id cũng không tải được bản mã.
  *
- * ── ĐỊNH DẠNG V2 ──────────────────────────────────────────────────────
+ * ── GÓI TIN (version 1) ────────────────────────────────────────────────
  *
- *   offset  size  nội dung
- *   0       4     magic "ZKV2"
- *   4       1     version = 2
- *   5       1     flags (dự phòng)
- *   6       4     chunkSize   (u32 BE)
- *   10      4     chunkCount  (u32 BE)
- *   14      8     noncePrefix
- *   22      2     metaLen     (u16 BE, đã gồm 16B tag)
- *   24      12    metaNonce
- *   36      metaLen  metadata đã mã hoá: {name, type, size}
- *   ..      *     [khối 0][khối 1]...[khối n-1], mỗi khối = bản mã ‖ 16B tag
+ *   +---------+-----------+------------------+----------+
+ *   | 0x01    | IV 12 B   | bản mã           | tag 16 B |
+ *   +---------+-----------+------------------+----------+
+ *   version   nonce       ciphertext          thẻ GCM
  *
- *   AAD(meta)   = header ‖ "meta"
- *   AAD(khối i) = header ‖ "chk" ‖ u32BE(i)
- *   nonce(i)    = noncePrefix ‖ u32BE(i)
+ *   AAD = byte version  → không thể đổi phiên bản định dạng mà không hỏng thẻ.
  *
- * Nhờ vậy: cắt bớt tệp -> số khối ít hơn chunkCount đã xác thực -> lỗi;
- * đảo khối -> AAD lệch -> lỗi; ghép khối từ tệp khác -> header lệch -> lỗi.
+ * Với văn bản ngắn (≤ 200 từ ≈ 2 KB) chỉ cần một khối GCM là đủ; không cần
+ * chia khối như khi mã hoá tệp lớn.
  */
 (function (root, factory) {
     const api = factory();
@@ -46,17 +36,12 @@
 })(typeof globalThis !== 'undefined' ? globalThis : this, function () {
     'use strict';
 
-    const MAGIC = Uint8Array.of(0x5A, 0x4B, 0x56, 0x32); // "ZKV2"
-    const VERSION = 2;
-    const HEADER_LEN = 36;
-    const KEY_BYTES = 32;
-    const TAG_BYTES = 16;
-    const NONCE_PREFIX_BYTES = 8;
-    const META_NONCE_BYTES = 12;
-    const DEFAULT_CHUNK_SIZE = 256 * 1024; // 256 KiB
-    const MIN_CHUNK_SIZE = 1024;
-    const MAX_CHUNK_SIZE = 4 * 1024 * 1024;
-    const MAX_CHUNKS = 1 << 20;
+    const VERSION = 0x01;
+    const KEY_BYTES = 32;   // AES-256
+    const IV_BYTES = 12;    // 96 bit — kích thước nonce khuyến nghị cho GCM
+    const TAG_BYTES = 16;   // thẻ xác thực 128 bit
+    const HEADER_BYTES = 1 + IV_BYTES;
+    const MIN_CONTAINER_BYTES = HEADER_BYTES + TAG_BYTES;
 
     const HKDF_INFO_ENC = 'zkv1/enc';
     const HKDF_INFO_AUTH = 'zkv1/auth';
@@ -70,18 +55,20 @@
         }
     }
 
-    /* ---------------- tiện ích ---------------- */
+    /* ------------------------------------------------------------------ */
+    /* Tiện ích                                                            */
+    /* ------------------------------------------------------------------ */
 
     function subtle() {
         const c = typeof globalThis !== 'undefined' ? globalThis.crypto : undefined;
         if (!c || !c.subtle) {
-            throw new VaultError('Không có Web Crypto API. Cần chạy trên https:// hoặc http://localhost.', 'NO_WEBCRYPTO');
+            throw new VaultError(
+                'Trình duyệt không cấp Web Crypto API. Cần chạy trên https:// hoặc http://localhost.',
+                'NO_WEBCRYPTO'
+            );
         }
         return c;
     }
-
-    const ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
-    const LOOKUP = new Map(Array.from(ALPHABET, (ch, i) => [ch, i]));
 
     function toBytes(value, label) {
         if (value instanceof Uint8Array) return value;
@@ -90,11 +77,6 @@
         }
         if (typeof ArrayBuffer !== 'undefined' && value instanceof ArrayBuffer) return new Uint8Array(value);
         throw new TypeError((label || 'Giá trị') + ' phải là Uint8Array/ArrayBuffer.');
-    }
-
-    function coerceBytes(value, label) {
-        if (typeof value === 'string') return base64UrlToBytes(value);
-        return toBytes(value, label);
     }
 
     function concatBytes(parts) {
@@ -109,10 +91,15 @@
         return out;
     }
 
+    const ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+    const LOOKUP = new Map(Array.from(ALPHABET, (ch, i) => [ch, i]));
+
+    /** Uint8Array -> Base64URL (không có '='). */
     function bytesToBase64Url(bytes) {
         const src = toBytes(bytes, 'dữ liệu');
         let out = '';
         let i = 0;
+
         for (; i + 3 <= src.length; i += 3) {
             const b0 = src[i], b1 = src[i + 1], b2 = src[i + 2];
             out += ALPHABET[b0 >> 2];
@@ -120,6 +107,7 @@
             out += ALPHABET[((b1 & 15) << 2) | (b2 >> 6)];
             out += ALPHABET[b2 & 63];
         }
+
         const remain = src.length - i;
         if (remain === 1) {
             const b0 = src[i];
@@ -134,13 +122,16 @@
         return out;
     }
 
+    /** Base64URL -> Uint8Array, kiểm tra nghiêm ngặt (không padding, không bit thừa). */
     function base64UrlToBytes(text) {
         const s = String(text).trim();
         if (s.length % 4 === 1) throw new VaultError('Chuỗi Base64URL có độ dài không hợp lệ.', 'BAD_BASE64');
+
         const out = new Uint8Array(Math.floor((s.length * 3) / 4));
         let acc = 0;
         let bits = 0;
         let o = 0;
+
         for (let i = 0; i < s.length; i++) {
             const v = LOOKUP.get(s[i]);
             if (v === undefined) throw new VaultError('Ký tự Base64URL không hợp lệ: "' + s[i] + '".', 'BAD_BASE64');
@@ -156,302 +147,166 @@
         return out.slice(0, o);
     }
 
-    function randomKey() {
-        return subtle().getRandomValues(new Uint8Array(KEY_BYTES));
-    }
-
-    function u32be(n) {
-        return Uint8Array.of((n >>> 24) & 0xff, (n >>> 16) & 0xff, (n >>> 8) & 0xff, n & 0xff);
-    }
-
     function toHex(bytes) {
         let out = '';
         for (let i = 0; i < bytes.length; i++) out += bytes[i].toString(16).padStart(2, '0');
         return out;
     }
 
-    /* ---------------- dẫn xuất khoá ---------------- */
+    /** 32 byte ngẫu nhiên từ CSPRNG của hệ điều hành. */
+    function randomKey() {
+        return subtle().getRandomValues(new Uint8Array(KEY_BYTES));
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Dẫn xuất khoá                                                       */
+    /* ------------------------------------------------------------------ */
 
     /**
-     * K -> { encKey (CryptoKey), authKey, id }
-     * @param {Uint8Array|string} rootKey 32 byte (hoặc Base64URL)
+     * K -> { encKey, authKey, authKeyB64, id }
+     *
+     * @param {Uint8Array} rootKey 32 byte (chính là key người dùng giữ)
+     * @returns {Promise<{encKey: CryptoKey, authKey: Uint8Array, authKeyB64: string, id: string}>}
      */
     async function deriveKeys(rootKey) {
         const c = subtle();
-        const keyBytes = coerceBytes(rootKey, 'Key');
+        const keyBytes = toBytes(rootKey, 'Key');
 
         if (keyBytes.length !== KEY_BYTES) {
             throw new VaultError('Key phải dài đúng ' + KEY_BYTES + ' byte, nhận ' + keyBytes.length + '.', 'BAD_KEY');
         }
 
-        const hkdf = await c.subtle.importKey('raw', keyBytes, 'HKDF', false, ['deriveBits']);
+        const hkdfKey = await c.subtle.importKey('raw', keyBytes, 'HKDF', false, ['deriveBits']);
+
         const derive = (info) => c.subtle.deriveBits(
-            { name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(0), info: new TextEncoder().encode(info) },
-            hkdf,
+            {
+                name: 'HKDF',
+                hash: 'SHA-256',
+                salt: new Uint8Array(0),
+                info: new TextEncoder().encode(info)
+            },
+            hkdfKey,
             KEY_BYTES * 8
         );
 
-        const [encBits, authBits] = await Promise.all([derive(HKDF_INFO_ENC), derive(HKDF_INFO_AUTH)]);
+        // Hai "nhánh" độc lập: lộ nhánh này không suy ra được nhánh kia
+        const [encBits, authBits] = await Promise.all([
+            derive(HKDF_INFO_ENC),
+            derive(HKDF_INFO_AUTH)
+        ]);
 
-        const encKeyBytes = new Uint8Array(encBits);
         const authKey = new Uint8Array(authBits);
+        const encKey = await c.subtle.importKey(
+            'raw',
+            new Uint8Array(encBits),
+            { name: 'AES-GCM' },
+            false,
+            ['encrypt', 'decrypt']
+        );
 
-        const encKey = await c.subtle.importKey('raw', encKeyBytes, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
-
-        const idDigest = await c.subtle.digest(
+        // id = 16 byte đầu của SHA-256("zkv1/id" ‖ authKey)
+        const digest = await c.subtle.digest(
             'SHA-256',
             concatBytes([new TextEncoder().encode(ID_DOMAIN), authKey])
         );
-        const id = toHex(new Uint8Array(idDigest).slice(0, 16));
+        const id = toHex(new Uint8Array(digest).slice(0, 16));
 
-        return { encKey, encKeyBytes, authKey, id };
+        return { encKey, authKey, authKeyB64: bytesToBase64Url(authKey), id };
     }
 
-    /* ---------------- header ---------------- */
-
-    function buildHeader({ chunkSize, chunkCount, noncePrefix, metaLen, metaNonce }) {
-        const header = new Uint8Array(HEADER_LEN);
-        header.set(MAGIC, 0);
-        header[4] = VERSION;
-        header[5] = 0;
-        const dv = new DataView(header.buffer);
-        dv.setUint32(6, chunkSize, false);
-        dv.setUint32(10, chunkCount, false);
-        header.set(noncePrefix, 14);
-        dv.setUint16(22, metaLen, false);
-        header.set(metaNonce, 24);
-        return header;
-    }
-
-    function readHeader(container) {
-        if (container.length < HEADER_LEN) {
-            throw new VaultError('Dữ liệu quá ngắn để là một tệp ZK-Vault.', 'BAD_CONTAINER');
-        }
-        for (let i = 0; i < 4; i++) {
-            if (container[i] !== MAGIC[i]) {
-                throw new VaultError('Không phải tệp ZK-Vault (sai magic).', 'BAD_CONTAINER');
-            }
-        }
-        if (container[4] !== VERSION) {
-            throw new VaultError('Phiên bản định dạng không hỗ trợ: ' + container[4] + '.', 'BAD_VERSION');
-        }
-
-        const dv = new DataView(container.buffer, container.byteOffset, container.byteLength);
-        const chunkSize = dv.getUint32(6, false);
-        const chunkCount = dv.getUint32(10, false);
-        const noncePrefix = container.slice(14, 22);
-        const metaLen = dv.getUint16(22, false);
-        const metaNonce = container.slice(24, 36);
-
-        if (chunkSize < MIN_CHUNK_SIZE || chunkSize > MAX_CHUNK_SIZE) {
-            throw new VaultError('Kích thước khối không hợp lệ: ' + chunkSize + '.', 'BAD_CONTAINER');
-        }
-        if (chunkCount > MAX_CHUNKS) {
-            throw new VaultError('Số khối quá lớn: ' + chunkCount + '.', 'BAD_CONTAINER');
-        }
-        if (metaLen < TAG_BYTES + 1 || HEADER_LEN + metaLen > container.length) {
-            throw new VaultError('Độ dài metadata không hợp lệ.', 'BAD_CONTAINER');
-        }
-
-        return { chunkSize, chunkCount, noncePrefix, metaLen, metaNonce };
-    }
-
-    /* ---------------- mã hoá ---------------- */
+    /* ------------------------------------------------------------------ */
+    /* Mã hoá / giải mã văn bản                                            */
+    /* ------------------------------------------------------------------ */
 
     /**
-     * @param {object} opts
-     * @param {Uint8Array} opts.bytes  nội dung tệp
-     * @param {string} opts.name      tên tệp (sẽ được mã hoá, server không thấy)
-     * @param {string} opts.type      MIME type (sẽ được mã hoá)
-     * @param {Uint8Array} opts.rootKey 32 byte
-     * @param {number} [opts.chunkSize]
+     * @param {string} text văn bản cần mã hoá
+     * @param {Uint8Array} rootKey 32 byte
+     * @returns {Promise<{container: Uint8Array, authKeyB64: string, id: string}>}
      */
-    async function encryptFile({ bytes, name, type, rootKey, chunkSize = DEFAULT_CHUNK_SIZE }) {
+    async function encryptText(text, rootKey) {
+        if (typeof text !== 'string') throw new TypeError('encryptText() cần một string.');
+
         const c = subtle();
-        const data = toBytes(bytes, 'Nội dung tệp');
-        const keys = await deriveKeys(rootKey);
+        const derived = await deriveKeys(rootKey);
 
-        const chunkCount = Math.ceil(data.length / chunkSize);
-        if (chunkCount > MAX_CHUNKS) {
-            throw new VaultError('Tệp quá lớn để mã hoá (' + chunkCount + ' khối).', 'TOO_LARGE');
-        }
+        const iv = c.getRandomValues(new Uint8Array(IV_BYTES));
+        const plaintext = new TextEncoder().encode(text);
 
-        const noncePrefix = c.getRandomValues(new Uint8Array(NONCE_PREFIX_BYTES));
-        const metaNonce = c.getRandomValues(new Uint8Array(META_NONCE_BYTES));
-
-        const metaJson = new TextEncoder().encode(JSON.stringify({
-            name: String(name || 'tep-khong-ten'),
-            type: String(type || 'application/octet-stream'),
-            size: data.length
-        }));
-        const metaLen = metaJson.length + TAG_BYTES;
-
-        const header = buildHeader({ chunkSize, chunkCount, noncePrefix, metaLen, metaNonce });
-        const headerAAD = header;
-
-        const metaCt = new Uint8Array(await c.subtle.encrypt(
+        // WebCrypto trả về [ciphertext ‖ tag] gộp chung
+        const sealed = new Uint8Array(await c.subtle.encrypt(
             {
                 name: 'AES-GCM',
-                iv: metaNonce,
-                additionalData: concatBytes([headerAAD, new TextEncoder().encode('meta')]),
-                tagLength: 128
+                iv,
+                additionalData: Uint8Array.of(VERSION),
+                tagLength: TAG_BYTES * 8
             },
-            keys.encKey,
-            metaJson
+            derived.encKey,
+            plaintext
         ));
 
-        const total = HEADER_LEN + metaLen + data.length + chunkCount * TAG_BYTES;
-        const out = new Uint8Array(total);
-        out.set(header, 0);
-        out.set(metaCt, HEADER_LEN);
+        const container = new Uint8Array(HEADER_BYTES + sealed.length);
+        container[0] = VERSION;
+        container.set(iv, 1);
+        container.set(sealed, HEADER_BYTES);
 
-        let inOff = 0;
-        let outOff = HEADER_LEN + metaLen;
-
-        for (let i = 0; i < chunkCount; i++) {
-            const end = Math.min(inOff + chunkSize, data.length);
-            const chunk = data.subarray(inOff, end);
-            const nonce = concatBytes([noncePrefix, u32be(i)]);
-
-            const ct = new Uint8Array(await c.subtle.encrypt(
-                {
-                    name: 'AES-GCM',
-                    iv: nonce,
-                    additionalData: concatBytes([headerAAD, new TextEncoder().encode('chk'), u32be(i)]),
-                    tagLength: 128
-                },
-                keys.encKey,
-                chunk
-            ));
-
-            out.set(ct, outOff);
-            outOff += ct.length;
-            inOff = end;
-        }
-
-        return {
-            container: out,
-            id: keys.id,
-            authKey: bytesToBase64Url(keys.authKey),
-            chunkCount,
-            chunkSize: DEFAULT_CHUNK_SIZE
-        };
+        return { container, authKeyB64: derived.authKeyB64, id: derived.id };
     }
 
-    /* ---------------- giải mã ---------------- */
-
     /**
-     * @param {object} opts
-     * @param {Uint8Array|string} opts.container  container hoặc Base64URL
-     * @param {Uint8Array} opts.rootKey
-     * @returns {Promise<{bytes:Uint8Array, name:string, type:string, size:number}>}
+     * @param {Uint8Array} container gói tin tải về từ server
+     * @param {Uint8Array} rootKey
+     * @returns {Promise<string>} văn bản gốc
      */
-    async function decryptFile({ container, rootKey }) {
+    async function decryptText(container, rootKey) {
         const c = subtle();
-        const raw = coerceBytes(container, 'Dữ liệu');
-        const headerInfo = readHeader(raw);
-        const { chunkSize, chunkCount, noncePrefix, metaLen, metaNonce } = headerInfo;
+        const raw = toBytes(container, 'Dữ liệu');
 
-        const keys = await deriveKeys(rootKey);
-        const header = raw.slice(0, HEADER_LEN);
+        if (raw.length < MIN_CONTAINER_BYTES) {
+            throw new VaultError('Dữ liệu quá ngắn để là một gói tin ZK-Vault.', 'BAD_CONTAINER');
+        }
+        if (raw[0] !== VERSION) {
+            throw new VaultError(
+                'Phiên bản định dạng không hỗ trợ: 0x' + raw[0].toString(16).padStart(2, '0') + '.',
+                'BAD_VERSION'
+            );
+        }
 
-        // --- metadata ---
-        const metaCt = raw.slice(HEADER_LEN, HEADER_LEN + metaLen);
-        let metaJson;
+        const derived = await deriveKeys(rootKey);
+        const iv = raw.slice(1, HEADER_BYTES);
+        const sealed = raw.slice(HEADER_BYTES);
+
+        let plaintext;
         try {
-            const plain = await c.subtle.decrypt(
+            plaintext = await c.subtle.decrypt(
                 {
                     name: 'AES-GCM',
-                    iv: metaNonce,
-                    additionalData: concatBytes([header, new TextEncoder().encode('meta')]),
-                    tagLength: 128
+                    iv,
+                    additionalData: Uint8Array.of(VERSION),
+                    tagLength: TAG_BYTES * 8
                 },
-                keys.encKey,
-                metaCt
+                derived.encKey,
+                sealed
             );
-            metaJson = JSON.parse(new TextDecoder().decode(plain));
-        } catch (err) {
-            throw new VaultError('Sai key hoặc dữ liệu đã bị sửa (metadata không xác thực được).', 'AUTH_FAILED');
+        } catch {
+            // GCM không phân biệt được "sai khoá" và "bị sửa" — cả hai đều là lỗi xác thực
+            throw new VaultError('Sai key hoặc dữ liệu đã bị thay đổi (thẻ xác thực không khớp).', 'AUTH_FAILED');
         }
 
-        if (!metaJson || typeof metaJson.size !== 'number' || metaJson.size < 0) {
-            throw new VaultError('Metadata không hợp lệ.', 'BAD_META');
-        }
-
-        // --- các khối ---
-        const chunkAreaStart = HEADER_LEN + metaLen;
-        const chunkAreaLen = raw.length - chunkAreaStart;
-        const out = new Uint8Array(metaJson.size);
-
-        let off = 0;
-        let cursor = chunkAreaStart;
-
-        for (let i = 0; i < chunkCount; i++) {
-            const isLast = i === chunkCount - 1;
-            const ctLen = isLast
-                ? chunkAreaLen - (chunkCount - 1) * (chunkSize + TAG_BYTES)
-                : chunkSize + TAG_BYTES;
-
-            if (ctLen <= TAG_BYTES || ctLen > chunkSize + TAG_BYTES || cursor + ctLen > raw.length) {
-                throw new VaultError('Tệp bị cắt ngắn hoặc hỏng ở khối ' + i + '.', 'TRUNCATED');
-            }
-
-            const nonce = concatBytes([noncePrefix, u32be(i)]);
-            let plain;
-            try {
-                plain = new Uint8Array(await c.subtle.decrypt(
-                    {
-                        name: 'AES-GCM',
-                        iv: nonce,
-                        additionalData: concatBytes([header, new TextEncoder().encode('chk'), u32be(i)]),
-                        tagLength: 128
-                    },
-                    keys.encKey,
-                    raw.subarray(cursor, cursor + ctLen)
-                ));
-            } catch (err) {
-                throw new VaultError('Sai key hoặc tệp đã bị sửa (khối ' + i + ' không xác thực được).', 'AUTH_FAILED');
-            }
-
-            if (off + plain.length > out.length) {
-                throw new VaultError('Kích thước giải mã vượt quá khai báo trong metadata.', 'BAD_SIZE');
-            }
-
-            out.set(plain, off);
-            off += plain.length;
-            cursor += ctLen;
-        }
-
-        if (cursor !== raw.length) {
-            throw new VaultError('Còn dữ liệu thừa sau khối cuối (tệp bị ghép thêm).', 'TRAILING_DATA');
-        }
-        if (off !== metaJson.size) {
-            throw new VaultError('Kích thước thực tế không khớp metadata (tệp bị cắt ngắn).', 'BAD_SIZE');
-        }
-
-        return {
-            bytes: out,
-            name: typeof metaJson.name === 'string' ? metaJson.name : 'tep-khong-ten',
-            type: typeof metaJson.type === 'string' ? metaJson.type : 'application/octet-stream',
-            size: metaJson.size
-        };
+        return new TextDecoder().decode(plaintext);
     }
 
     return {
-        MAGIC,
         VERSION,
-        HEADER_LEN,
         KEY_BYTES,
+        IV_BYTES,
         TAG_BYTES,
-        DEFAULT_CHUNK_SIZE,
+        MIN_CONTAINER_BYTES,
         VaultError,
-        deriveKeys,
-        encryptFile,
-        decryptFile,
-        readHeader,
         randomKey,
+        deriveKeys,
+        encryptText,
+        decryptText,
         bytesToBase64Url,
-        base64UrlToBytes,
-        toHex
+        base64UrlToBytes
     };
 });

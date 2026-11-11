@@ -4,6 +4,7 @@ __pycache__/
 .env
 .DS_Store
 
-# dữ liệu người dùng chạy server sinh ra — không bao giờ commit
+# dữ liệu sinh ra khi chạy server — không commit
 data/
+_tmp/
 _scratch/

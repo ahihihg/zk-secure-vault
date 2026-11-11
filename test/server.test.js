@@ -1,5 +1,5 @@
 /**
- * Test API của server: upload / download / delete, TTL, chế độ tự huỷ, rate limit.
+ * Test API server: lưu / trả lại bản mã, TTL, giới hạn, phân quyền.
  * Chạy: node --test test/server.test.js
  */
 'use strict';
@@ -10,106 +10,126 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
-const { createVaultServer } = require('../src/server.js');
+const { createServer } = require('../src/server.js');
 const zk = require('../src/crypto.js');
-const kc = require('../src/keycode.js');
 
 let counter = 0;
 
 async function startServer(options = {}) {
     const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zkv-test-' + (counter++) + '-'));
-    const vault = createVaultServer({ dataDir, ...options });
-    await new Promise((resolve) => vault.server.listen(0, '127.0.0.1', resolve));
-    const port = vault.server.address().port;
+    const vault = createServer({ dataDir, ...options });
+    await new Promise((r) => vault.server.listen(0, '127.0.0.1', r));
+
     return {
         vault,
-        port,
-        base: 'http://127.0.0.1:' + port,
-        dataDir,
+        base: 'http://127.0.0.1:' + vault.server.address().port,
         async close() {
-            await new Promise((resolve) => vault.server.close(resolve));
+            await new Promise((r) => vault.server.close(r));
             fs.rmSync(dataDir, { recursive: true, force: true });
         }
     };
 }
 
-/** Mã hoá một tệp y như client thật rồi trả về { rootKey, authKey, container }. */
-async function seal(name, type, bytes) {
+/** Mã hoá văn bản y như client thật, trả về dữ liệu cần cho fetch. */
+async function seal(text) {
     const rootKey = zk.randomKey();
-    const enc = await zk.encryptFile({ bytes, name, type, rootKey });
-    return { rootKey, authKey: enc.authKey, container: Buffer.from(enc.container), id: enc.id };
+    const sealed = await zk.encryptText(text, rootKey);
+    return { rootKey, ...sealed };
 }
 
-const auth = (authKey) => ({ Authorization: 'Bearer ' + authKey });
+const auth = (authKeyB64) => ({ Authorization: 'Bearer ' + authKeyB64 });
+
+/* ------------------------------------------------------------------ */
 
 test('health check', async () => {
     const s = await startServer();
     try {
         const res = await fetch(s.base + '/api/health');
         assert.equal(res.status, 200);
-        const body = await res.json();
-        assert.equal(body.ok, true);
+        assert.equal((await res.json()).ok, true);
     } finally {
         await s.close();
     }
 });
 
-test('upload rồi download trả về đúng byte đã gửi', async () => {
+test('gửi rồi lấy lại đúng byte bản mã', async () => {
     const s = await startServer();
     try {
-        const payload = Buffer.from([0, 1, 2, 3, 250, 251, 252, 253]);
-        const sealed = await seal('a.bin', 'application/octet-stream', payload);
+        const sealed = await seal('mã két sắt 4821');
 
-        const up = await fetch(s.base + '/api/blob?ttl=3600', {
-            method: 'POST', headers: auth(sealed.authKey), body: sealed.container
+        const up = await fetch(s.base + '/api/secret', {
+            method: 'POST', headers: auth(sealed.authKeyB64), body: sealed.container
         });
         assert.equal(up.status, 201);
-        const upBody = await up.json();
-        assert.equal(upBody.id, sealed.id);
-        assert.equal(upBody.size, sealed.container.length);
+        const info = await up.json();
+        assert.equal(info.id, sealed.id);
+        assert.equal(info.size, sealed.container.length);
 
-        const down = await fetch(s.base + '/api/blob', { headers: auth(sealed.authKey) });
+        const down = await fetch(s.base + '/api/secret', { headers: auth(sealed.authKeyB64) });
         assert.equal(down.status, 200);
-        const got = Buffer.from(await down.arrayBuffer());
-        assert.deepEqual(got, sealed.container);
-        assert.equal(down.headers.get('content-type'), 'application/octet-stream');
-        assert.ok(down.headers.get('x-zkv-expires'));
+        assert.deepEqual(Buffer.from(await down.arrayBuffer()), Buffer.from(sealed.container));
     } finally {
         await s.close();
     }
 });
 
-test('server không lưu được bất cứ thứ gì đọc được từ tệp', async () => {
+test('đi trọn vòng: gửi bằng máy A, đọc lại bằng key ở máy B', async () => {
     const s = await startServer();
     try {
-        const sealed = await seal('hop-dong-mat.pdf', 'application/pdf', Buffer.from('nội dung tuyệt mật'));
-        await fetch(s.base + '/api/blob', { method: 'POST', headers: auth(sealed.authKey), body: sealed.container });
+        const text = 'Hợp đồng thuê nhà số 42 — 12 triệu/tháng';
+        const rootKey = zk.randomKey();
+        const sealed = await zk.encryptText(text, rootKey);
 
-        const onDisk = fs.readFileSync(s.vault.blobPath(sealed.id)).toString('latin1');
-        assert.equal(onDisk.includes('hop-dong-mat'), false);
-        assert.equal(onDisk.includes('tuyệt mật'), false);
-
-        // Trong DB chỉ có id (hash) và metadata vận hành
-        const rows = s.vault.db.prepare('SELECT * FROM blobs').all();
-        assert.equal(rows.length, 1);
-        assert.equal(rows[0].id, sealed.id);
-        assert.equal(Object.keys(rows[0]).includes('key'), false);
-    } finally {
-        await s.close();
-    }
-});
-
-test('key khác thì không tìm thấy tệp (và không có oracle để dò)', async () => {
-    const s = await startServer();
-    try {
-        const sealed = await seal('a.txt', 'text/plain', Buffer.from('x'));
-        await fetch(s.base + '/api/blob', { method: 'POST', headers: auth(sealed.authKey), body: sealed.container });
-
-        const otherKey = kc.encode(zk.randomKey());
-        const otherAuth = (await zk.deriveKeys(kc.decode(otherKey))).authKey;
-        const res = await fetch(s.base + '/api/blob', {
-            headers: auth(zk.bytesToBase64Url(otherAuth))
+        await fetch(s.base + '/api/secret', {
+            method: 'POST', headers: auth(sealed.authKeyB64), body: sealed.container
         });
+
+        // "Máy B" chỉ có key, không có gì khác
+        const keyText = require('../src/keycode.js').encode(rootKey);
+        const keyBytes = require('../src/keycode.js').decode(keyText);
+        const derived = await zk.deriveKeys(keyBytes);
+
+        const res = await fetch(s.base + '/api/secret', { headers: auth(derived.authKeyB64) });
+        const container = new Uint8Array(await res.arrayBuffer());
+
+        assert.equal(await zk.decryptText(container, keyBytes), text);
+    } finally {
+        await s.close();
+    }
+});
+
+test('server không lưu được nội dung đọc được', async () => {
+    const s = await startServer();
+    try {
+        const sealed = await seal('nội dung tuyệt mật hop-dong');
+        await fetch(s.base + '/api/secret', {
+            method: 'POST', headers: auth(sealed.authKeyB64), body: sealed.container
+        });
+
+        const rows = s.vault.db.prepare('SELECT id, body FROM secrets').all();
+        assert.equal(rows.length, 1);
+
+        const stored = Buffer.from(rows[0].body).toString('latin1');
+        assert.equal(stored.includes('hop-dong'), false);
+        assert.equal(stored.includes('tuyệt mật'), false);
+
+        // và bảng không có cột nào chứa key
+        assert.deepEqual(Object.keys(rows[0]), ['id', 'body']);
+    } finally {
+        await s.close();
+    }
+});
+
+test('key khác thì không tìm thấy gì', async () => {
+    const s = await startServer();
+    try {
+        const sealed = await seal('x');
+        await fetch(s.base + '/api/secret', {
+            method: 'POST', headers: auth(sealed.authKeyB64), body: sealed.container
+        });
+
+        const other = await zk.deriveKeys(zk.randomKey());
+        const res = await fetch(s.base + '/api/secret', { headers: auth(other.authKeyB64) });
         assert.equal(res.status, 404);
     } finally {
         await s.close();
@@ -119,70 +139,42 @@ test('key khác thì không tìm thấy tệp (và không có oracle để dò)'
 test('thiếu Authorization -> 401', async () => {
     const s = await startServer();
     try {
-        const res = await fetch(s.base + '/api/blob');
-        assert.equal(res.status, 401);
+        assert.equal((await fetch(s.base + '/api/secret')).status, 401);
+        assert.equal((await fetch(s.base + '/api/secret', {
+            method: 'POST', body: Buffer.alloc(30)
+        })).status, 401);
     } finally {
         await s.close();
     }
 });
 
-test('chế độ tự huỷ: tải lần đầu được, lần hai mất', async () => {
-    const s = await startServer();
-    try {
-        const sealed = await seal('burn.txt', 'text/plain', Buffer.from('chỉ xem một lần'));
-        await fetch(s.base + '/api/blob?burn=1', { method: 'POST', headers: auth(sealed.authKey), body: sealed.container });
-
-        const first = await fetch(s.base + '/api/blob', { headers: auth(sealed.authKey) });
-        assert.equal(first.status, 200);
-        assert.equal(first.headers.get('x-zkv-remaining'), '0');
-
-        const second = await fetch(s.base + '/api/blob', { headers: auth(sealed.authKey) });
-        assert.equal(second.status, 404);
-        assert.equal(fs.existsSync(s.vault.blobPath(sealed.id)), false);
-    } finally {
-        await s.close();
-    }
-});
-
-test('hết hạn TTL thì tệp bị xoá', async () => {
+test('hết hạn TTL thì văn bản bị xoá', async () => {
     let clock = Date.now();
-    const s = await startServer({ now: () => clock, minTtl: 1 });
+    const s = await startServer({ now: () => clock, ttlSeconds: 60 });
     try {
-        const sealed = await seal('ttl.txt', 'text/plain', Buffer.from('sống ngắn'));
-        await fetch(s.base + '/api/blob?ttl=1', { method: 'POST', headers: auth(sealed.authKey), body: sealed.container });
+        const sealed = await seal('sống ngắn');
+        await fetch(s.base + '/api/secret', {
+            method: 'POST', headers: auth(sealed.authKeyB64), body: sealed.container
+        });
 
-        assert.equal((await fetch(s.base + '/api/blob', { headers: auth(sealed.authKey) })).status, 200);
+        assert.equal((await fetch(s.base + '/api/secret', { headers: auth(sealed.authKeyB64) })).status, 200);
 
-        clock += 5000; // tua đồng hồ 5 giây
-        const expired = await fetch(s.base + '/api/blob', { headers: auth(sealed.authKey) });
-        assert.equal(expired.status, 404);
-        assert.equal(fs.existsSync(s.vault.blobPath(sealed.id)), false);
+        clock += 61_000;
+        assert.equal((await fetch(s.base + '/api/secret', { headers: auth(sealed.authKeyB64) })).status, 404);
+
+        const rows = s.vault.db.prepare('SELECT COUNT(*) AS n FROM secrets').get();
+        assert.equal(rows.n, 0);
     } finally {
         await s.close();
     }
 });
 
-test('DELETE bằng key đúng thì xoá', async () => {
-    const s = await startServer();
+test('dữ liệu vượt giới hạn -> 413', async () => {
+    const s = await startServer({ maxBytes: 256 });
     try {
-        const sealed = await seal('del.txt', 'text/plain', Buffer.from('x'));
-        await fetch(s.base + '/api/blob', { method: 'POST', headers: auth(sealed.authKey), body: sealed.container });
-
-        const del = await fetch(s.base + '/api/blob', { method: 'DELETE', headers: auth(sealed.authKey) });
-        assert.equal(del.status, 200);
-
-        assert.equal((await fetch(s.base + '/api/blob', { headers: auth(sealed.authKey) })).status, 404);
-    } finally {
-        await s.close();
-    }
-});
-
-test('tệp vượt giới hạn dung lượng -> 413', async () => {
-    const s = await startServer({ maxBytes: 1024 });
-    try {
-        const sealed = await seal('big.bin', 'application/octet-stream', Buffer.alloc(4096, 1));
-        const res = await fetch(s.base + '/api/blob', {
-            method: 'POST', headers: auth(sealed.authKey), body: sealed.container
+        const sealed = await seal('a'.repeat(1000));
+        const res = await fetch(s.base + '/api/secret', {
+            method: 'POST', headers: auth(sealed.authKeyB64), body: sealed.container
         });
         assert.equal(res.status, 413);
     } finally {
@@ -190,14 +182,27 @@ test('tệp vượt giới hạn dung lượng -> 413', async () => {
     }
 });
 
-test('rate limit chặn upload hàng loạt', async () => {
+test('gói tin quá ngắn -> 400', async () => {
+    const s = await startServer();
+    try {
+        const d = await zk.deriveKeys(zk.randomKey());
+        const res = await fetch(s.base + '/api/secret', {
+            method: 'POST', headers: auth(d.authKeyB64), body: Buffer.alloc(5)
+        });
+        assert.equal(res.status, 400);
+    } finally {
+        await s.close();
+    }
+});
+
+test('rate limit chặn gửi dồn dập', async () => {
     const s = await startServer({ rateMaxPost: 3 });
     try {
         const statuses = [];
         for (let i = 0; i < 5; i++) {
-            const sealed = await seal('r.txt', 'text/plain', Buffer.from('r'));
-            const res = await fetch(s.base + '/api/blob', {
-                method: 'POST', headers: auth(sealed.authKey), body: sealed.container
+            const sealed = await seal('r');
+            const res = await fetch(s.base + '/api/secret', {
+                method: 'POST', headers: auth(sealed.authKeyB64), body: sealed.container
             });
             statuses.push(res.status);
         }
@@ -208,22 +213,23 @@ test('rate limit chặn upload hàng loạt', async () => {
     }
 });
 
-test('không phục vụ được file ngoài thư mục public (path traversal)', async () => {
+test('không phục vụ file ngoài thư mục public', async () => {
     const s = await startServer();
     try {
-        const res = await fetch(s.base + '/../src/server.js');
+        const res = await fetch(s.base + '/../../src/server.js');
         assert.ok(res.status === 403 || res.status === 404, 'phải chặn, nhận ' + res.status);
     } finally {
         await s.close();
     }
 });
 
-test('trang chủ trả về HTML kèm CSP chặt', async () => {
+test('trang chủ trả HTML kèm CSP chặt', async () => {
     const s = await startServer();
     try {
         const res = await fetch(s.base + '/');
         assert.equal(res.status, 200);
         assert.match(res.headers.get('content-type'), /text\/html/);
+
         const csp = res.headers.get('content-security-policy');
         assert.match(csp, /default-src 'self'/);
         assert.match(csp, /frame-ancestors 'none'/);
@@ -233,19 +239,12 @@ test('trang chủ trả về HTML kèm CSP chặt', async () => {
     }
 });
 
-test('PoC văn bản phục vụ được ở /poc-text/', async () => {
+test('thư viện dùng chung được phục vụ từ src/', async () => {
     const s = await startServer();
     try {
-        for (const p of ['/poc-text', '/poc-text/', '/poc-text/app.js', '/poc-text/style.css']) {
-            const res = await fetch(s.base + p);
-            assert.equal(res.status, 200, 'phải phục vụ được ' + p);
+        for (const p of ['/crypto.js', '/keycode.js', '/app.js', '/style.css']) {
+            assert.equal((await fetch(s.base + p)).status, 200, 'phải phục vụ được ' + p);
         }
-        const html = await (await fetch(s.base + '/poc-text/')).text();
-        assert.match(html, /Gửi văn bản bằng một key/);
-
-        // vẫn chặn thoát khỏi thư mục
-        const bad = await fetch(s.base + '/poc-text/..%2f..%2fsrc%2fserver.js');
-        assert.ok(bad.status === 403 || bad.status === 404, 'phải chặn traversal, nhận ' + bad.status);
     } finally {
         await s.close();
     }

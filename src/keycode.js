@@ -1,15 +1,15 @@
 /*!
- * ZK-Vault — mã hoá key dạng người đọc được (Crockford Base32 + checksum).
+ * keycode.js — biến 32 byte ngẫu nhiên thành một "key" người đọc được.
  *
- *   ZKV1-7F3K-9QW2-M4TB-K8XR-2N5D-J6HY-0P3V-...
- *   └──┘ └──────────────── 14 nhóm × 4 ký tự ────────────────┘
- *   prefix      52 ký tự dữ liệu (256-bit) + 4 ký tự checksum
+ *   ZKV1-7F3K-9QW2-M4TB-K8XR-2N5D-J6HY-0P3V-K1AC-8W6E
+ *   └──┘ └──────────── 14 nhóm × 4 ký tự ─────────────┘
+ *   tiền tố      52 ký tự dữ liệu (256 bit) + 4 ký tự checksum
  *
  * Vì sao không dùng Base64URL cho key?
- *   - Base64URL có "0/O", "1/l/I" — gõ tay hoặc đọc qua điện thoại rất dễ sai.
- *   - Crockford Base32 loại bỏ I, L, O, U nên tự sửa được các nhầm lẫn phổ biến.
- *   - 4 ký tự checksum (20 bit) đủ để báo "key gõ sai" ngay, thay vì để người
- *     dùng nhận thông báo mơ hồ "sai key hoặc file hỏng".
+ *   Base64URL có cặp ký tự dễ nhầm khi đọc hoặc gõ tay: 0 với O, 1 với l/I.
+ *   Crockford Base32 loại bỏ I, L, O, U nên còn 32 ký tự không nhập nhằng.
+ *   4 ký tự checksum (20 bit) giúp báo "key gõ sai" ngay, thay vì để người
+ *   dùng nhận thông báo mơ hồ "sai key hoặc dữ liệu hỏng".
  *
  * Chạy được ở cả trình duyệt (window.ZKKeycode) và Node (module.exports).
  */
@@ -23,11 +23,13 @@
 })(typeof globalThis !== 'undefined' ? globalThis : this, function () {
     'use strict';
 
-    const ALPHABET = '0123456789ABCDEFGHJKMNPQRSTVWXYZ'; // 32 ký tự, bỏ I L O U
+    const ALPHABET = '0123456789ABCDEFGHJKMNPQRSTVWXYZ'; // 32 ký tự, không có I L O U
     const PREFIX = 'ZKV1';
     const KEY_BYTES = 32;
-    const DATA_CHARS = 52;      // ceil(256 / 5)
-    const CHECK_CHARS = 4;      // 20 bit checksum
+
+    // 256 bit / 5 bit = 51,2 -> cần 52 ký tự; 4 bit đệm ở ký tự cuối phải bằng 0
+    const DATA_CHARS = 52;
+    const CHECK_CHARS = 4;
     const TOTAL_CHARS = DATA_CHARS + CHECK_CHARS;
     const GROUP_SIZE = 4;
 
@@ -39,7 +41,9 @@
         }
     }
 
-    /* ---------------- CRC-32 (chỉ để bắt lỗi gõ tay) ---------------- */
+    /* ------------------------------------------------------------------ */
+    /* CRC-32 — chỉ để bắt lỗi gõ tay, không liên quan tới bảo mật        */
+    /* ------------------------------------------------------------------ */
 
     let CRC_TABLE = null;
 
@@ -61,31 +65,25 @@
         return (crc ^ -1) >>> 0;
     }
 
+    /** 20 bit đầu của CRC-32, mã hoá thành 4 ký tự Base32. */
     function checksumChars(dataChars) {
-        const bytes = new TextEncoder().encode('zkv1/check:' + dataChars);
-        const c = crc32(bytes);
+        const crc = crc32(new TextEncoder().encode('zkv1/check:' + dataChars));
         let out = '';
         for (let i = 0; i < CHECK_CHARS; i++) {
-            out += ALPHABET[(c >>> (27 - i * 5)) & 31];
+            out += ALPHABET[(crc >>> (27 - i * 5)) & 31];
         }
         return out;
     }
 
-    /* ---------------- mã hoá / giải mã ---------------- */
-
-    function toUint8Array(value, label) {
-        if (value instanceof Uint8Array) return value;
-        if (typeof ArrayBuffer !== 'undefined' && ArrayBuffer.isView(value)) {
-            return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
-        }
-        if (typeof ArrayBuffer !== 'undefined' && value instanceof ArrayBuffer) return new Uint8Array(value);
-        throw new KeyFormatError((label || 'Giá trị') + ' phải là Uint8Array.');
-    }
+    /* ------------------------------------------------------------------ */
+    /* Base32                                                              */
+    /* ------------------------------------------------------------------ */
 
     function encodeBase32(bytes) {
         let acc = 0;
         let bits = 0;
         let out = '';
+
         for (let i = 0; i < bytes.length; i++) {
             acc = (acc << 8) | bytes[i];
             bits += 8;
@@ -94,7 +92,7 @@
                 out += ALPHABET[(acc >>> bits) & 31];
             }
         }
-        if (bits > 0) out += ALPHABET[(acc << (5 - bits)) & 31];
+        if (bits > 0) out += ALPHABET[(acc << (5 - bits)) & 31]; // đệm 0 vào cuối
         return out;
     }
 
@@ -103,6 +101,7 @@
         let acc = 0;
         let bits = 0;
         let o = 0;
+
         for (let i = 0; i < text.length; i++) {
             const v = ALPHABET.indexOf(text[i]);
             if (v < 0) throw new KeyFormatError('Ký tự không hợp lệ trong key: "' + text[i] + '".');
@@ -114,51 +113,67 @@
                 acc &= (1 << bits) - 1;
             }
         }
-        if (bits > 0 && acc !== 0) {
-            throw new KeyFormatError('Key không hợp lệ: bit thừa phải bằng 0.');
-        }
+        // Bit đệm phải bằng 0, nếu không thì đây không phải key do hệ thống sinh ra
+        if (bits > 0 && acc !== 0) throw new KeyFormatError('Key không hợp lệ: bit đệm phải bằng 0.');
         return out.slice(0, o);
     }
 
-    function group(text) {
-        const parts = [];
-        for (let i = 0; i < text.length; i += GROUP_SIZE) parts.push(text.substr(i, GROUP_SIZE));
-        return parts.join('-');
+    /* ------------------------------------------------------------------ */
+    /* API công khai                                                       */
+    /* ------------------------------------------------------------------ */
+
+    function toUint8Array(value, label) {
+        if (value instanceof Uint8Array) return value;
+        if (typeof ArrayBuffer !== 'undefined' && ArrayBuffer.isView(value)) {
+            return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+        }
+        if (typeof ArrayBuffer !== 'undefined' && value instanceof ArrayBuffer) return new Uint8Array(value);
+        throw new KeyFormatError((label || 'Giá trị') + ' phải là Uint8Array.');
     }
 
-    /** Chuẩn hoá input người dùng dán vào: bỏ khoảng trắng, gạch, prefix, sửa nhầm lẫn. */
-    function normalize(input) {
-        let s = String(input == null ? '' : input)
-            .toUpperCase()
-            .replace(/[\s\-_.]/g, '');
-
-        // Sửa nhầm lẫn phổ biến TRƯỚC khi bỏ prefix, để "ZKVL"/"ZKVI" vẫn được hiểu là "ZKV1"
-        s = s.replace(/O/g, '0').replace(/[IL]/g, '1');
-
-        // Chỉ bỏ prefix khi chuỗi dài hơn phần thân - tránh cắt nhầm dữ liệu thật
-        if (s.startsWith(PREFIX) && s.length > TOTAL_CHARS) s = s.slice(PREFIX.length);
-
-        return s;
-    }
-
-    /** 32 byte -> "ZKV1-XXXX-XXXX-...-XXXX" */
+    /** 32 byte -> "ZKV1-XXXX-XXXX-…-XXXX" */
     function encode(keyBytes) {
         const bytes = toUint8Array(keyBytes, 'Key');
         if (bytes.length !== KEY_BYTES) {
             throw new KeyFormatError('Key phải dài đúng ' + KEY_BYTES + ' byte, nhận ' + bytes.length + '.');
         }
         const data = encodeBase32(bytes);
-        return PREFIX + '-' + group(data + checksumChars(data));
+        const full = data + checksumChars(data);
+
+        const groups = [];
+        for (let i = 0; i < full.length; i += GROUP_SIZE) groups.push(full.substr(i, GROUP_SIZE));
+        return PREFIX + '-' + groups.join('-');
     }
 
-    /** "ZKV1-xxxx-..." -> 32 byte. Ném KeyFormatError với thông báo tiếng Việt. */
+    /**
+     * Chuẩn hoá những gì người dùng dán vào:
+     *   - bỏ khoảng trắng, gạch nối, dấu chấm; chuyển về chữ hoa
+     *   - sửa nhầm lẫn O -> 0, I/L -> 1 (phải làm TRƯỚC khi bỏ tiền tố,
+     *     để "ZKVL-…" vẫn được hiểu là "ZKV1-…")
+     *   - bỏ tiền tố ZKV1 nếu có
+     */
+    function normalize(input) {
+        let s = String(input == null ? '' : input)
+            .toUpperCase()
+            .replace(/[\s\-_.]/g, '');
+
+        s = s.replace(/O/g, '0').replace(/[IL]/g, '1');
+
+        // Chỉ cắt tiền tố khi chuỗi dài hơn phần thân, tránh cắt nhầm dữ liệu thật
+        if (s.startsWith(PREFIX) && s.length > TOTAL_CHARS) s = s.slice(PREFIX.length);
+
+        return s;
+    }
+
+    /** "ZKV1-…" -> 32 byte. */
     function decode(input) {
         const s = normalize(input);
 
         if (!s) throw new KeyFormatError('Chưa nhập key.');
         if (s.length !== TOTAL_CHARS) {
             throw new KeyFormatError(
-                'Key phải có ' + TOTAL_CHARS + ' ký tự, bạn nhập ' + s.length + ' ký tự. Kiểm tra xem có bị thiếu đoạn nào không.'
+                'Key phải có ' + TOTAL_CHARS + ' ký tự, bạn nhập ' + s.length +
+                '. Kiểm tra xem có bị thiếu đoạn nào không.'
             );
         }
 
@@ -171,7 +186,7 @@
 
         const bytes = decodeBase32(data);
         if (bytes.length !== KEY_BYTES) {
-            throw new KeyFormatError('Key không hợp lệ: độ dài sau giải mã là ' + bytes.length + ' byte.');
+            throw new KeyFormatError('Key không hợp lệ: sau giải mã chỉ còn ' + bytes.length + ' byte.');
         }
         return bytes;
     }
@@ -180,13 +195,12 @@
         try {
             decode(input);
             return true;
-        } catch (err) {
+        } catch {
             return false;
         }
     }
 
     return {
-        ALPHABET,
         PREFIX,
         KEY_BYTES,
         TOTAL_CHARS,
@@ -194,7 +208,6 @@
         encode,
         decode,
         isValid,
-        normalize,
-        group
+        normalize
     };
 });

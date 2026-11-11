@@ -1,12 +1,10 @@
 /**
- * E2E: chạy server thật + Chrome headless, thao tác như người dùng.
- *   - thả tệp vào ô drop -> bấm mã hoá -> nhận key
- *   - mở tab khác, dán key -> giải mã -> xem trước
- *   - gõ sai key -> báo lỗi checksum
- *   - chế độ tự huỷ: tải lần 2 phải thất bại
+ * Kiểm thử end-to-end bằng Chrome headless: thao tác thật như người dùng.
  *
- * Chạy: node test/e2e.cjs
- * Cần Chrome hoặc Edge (đặt biến môi trường CHROME nếu cài ở đường dẫn khác).
+ *   node test/e2e.cjs
+ *
+ * Cần Chrome hoặc Edge (đặt biến môi trường CHROME nếu cài ở chỗ khác).
+ * Script tự bật một server tạm trên cổng ngẫu nhiên rồi mở trình duyệt.
  */
 'use strict';
 
@@ -15,7 +13,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
 
-const { createVaultServer } = require('../src/server.js');
+const { createServer } = require('../src/server.js');
 
 const CHROME = process.env.CHROME || [
     'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
@@ -28,40 +26,30 @@ if (!CHROME) {
 }
 
 const DOCS = path.join(__dirname, '..', 'docs');
-const PNG_1x1 = Buffer.from(
-    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
-    'base64'
-);
-
+const PORT_DEBUG = 9336;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-/* ------------------------- CDP ------------------------- */
+/* ----------------------------- CDP ----------------------------- */
 
 class CDP {
     constructor(ws) {
         this.ws = ws;
         this.id = 0;
         this.pending = new Map();
-        this.events = new Map();
         this.errors = [];
+
         ws.addEventListener('message', (ev) => {
-            const msg = JSON.parse(ev.data);
-            if (msg.id && this.pending.has(msg.id)) {
-                const { resolve, reject } = this.pending.get(msg.id);
-                this.pending.delete(msg.id);
-                msg.error ? reject(new Error(JSON.stringify(msg.error))) : resolve(msg.result);
-            } else if (msg.method === 'Log.entryAdded' && msg.params.entry.level === 'error') {
-                this.errors.push(msg.params.entry.text);
-            } else if (msg.method === 'Network.responseReceived' && msg.params.response.status >= 400) {
-                this.errors.push('HTTP ' + msg.params.response.status + ' ' + msg.params.response.url);
-            } else if (msg.method === 'Runtime.exceptionThrown') {
-                this.errors.push(msg.params.exceptionDetails.text + ' ' +
-                    (msg.params.exceptionDetails.exception?.description || ''));
-            } else if (msg.method && this.events.has(msg.method)) {
-                for (const fn of this.events.get(msg.method)) fn(msg.params);
+            const m = JSON.parse(ev.data);
+            if (m.id && this.pending.has(m.id)) {
+                const { resolve, reject } = this.pending.get(m.id);
+                this.pending.delete(m.id);
+                m.error ? reject(new Error(JSON.stringify(m.error))) : resolve(m.result);
+            } else if (m.method === 'Runtime.exceptionThrown') {
+                this.errors.push(m.params.exceptionDetails.text);
             }
         });
     }
+
     send(method, params = {}) {
         const id = ++this.id;
         return new Promise((resolve, reject) => {
@@ -69,23 +57,18 @@ class CDP {
             this.ws.send(JSON.stringify({ id, method, params }));
         });
     }
-    once(method) {
-        return new Promise((resolve) => {
-            const fn = (p) => { this.events.delete(method); resolve(p); };
-            if (!this.events.has(method)) this.events.set(method, []);
-            this.events.get(method).push(fn);
-        });
-    }
+
     async eval(expr) {
         const r = await this.send('Runtime.evaluate', { expression: expr, awaitPromise: true, returnByValue: true });
         if (r.exceptionDetails) {
-            throw new Error('JS exception: ' + (r.exceptionDetails.exception?.description || r.exceptionDetails.text));
+            throw new Error(r.exceptionDetails.text + ' ' + (r.exceptionDetails.exception?.description || ''));
         }
         return r.result.value;
     }
+
     async waitFor(expr, timeoutMs = 8000) {
-        const deadline = Date.now() + timeoutMs;
-        while (Date.now() < deadline) {
+        const end = Date.now() + timeoutMs;
+        while (Date.now() < end) {
             if (await this.eval(expr)) return true;
             await sleep(80);
         }
@@ -93,183 +76,113 @@ class CDP {
     }
 }
 
-async function connect(wsUrl) {
-    const ws = new WebSocket(wsUrl);
+async function openTab(url) {
+    const res = await fetch('http://127.0.0.1:' + PORT_DEBUG + '/json/new?' + encodeURIComponent(url), { method: 'PUT' });
+    const target = await res.json();
+
+    const ws = new WebSocket(target.webSocketDebuggerUrl);
     await new Promise((resolve, reject) => {
         ws.addEventListener('open', resolve, { once: true });
         ws.addEventListener('error', reject, { once: true });
     });
+
     const cdp = new CDP(ws);
     await cdp.send('Page.enable');
     await cdp.send('Runtime.enable');
-    await cdp.send('Log.enable');
-    await cdp.send('Emulation.setDeviceMetricsOverride', { width: 1000, height: 1400, deviceScaleFactor: 1, mobile: false });
+    await cdp.send('Emulation.setDeviceMetricsOverride', { width: 1100, height: 820, deviceScaleFactor: 1, mobile: false });
+    await sleep(600);
     return { cdp, ws };
 }
 
-async function openTab(url) {
-    const res = await fetch('http://127.0.0.1:9334/json/new?' + encodeURIComponent(url), { method: 'PUT' });
-    const target = await res.json();
-    const { cdp, ws } = await connect(target.webSocketDebuggerUrl);
-    await cdp.send('Network.enable');
-    await sleep(700);
-    return { cdp, ws };
+async function shot(cdp, file) {
+    const png = await cdp.send('Page.captureScreenshot', { format: 'png', captureBeyondViewport: true });
+    fs.mkdirSync(DOCS, { recursive: true });
+    fs.writeFileSync(file, Buffer.from(png.data, 'base64'));
 }
 
-async function capture(cdp, file) {
-    const metrics = await cdp.send('Page.getLayoutMetrics');
-    const h = Math.min(metrics.cssContentSize.height, 6000);
-    const shot = await cdp.send('Page.captureScreenshot', {
-        format: 'png', captureBeyondViewport: true,
-        clip: { x: 0, y: 0, width: 1000, height: h, scale: 1 }
-    });
-    fs.writeFileSync(file, Buffer.from(shot.data, 'base64'));
-}
-
-/* ------------------------- main ------------------------- */
+/* ----------------------------- chạy ----------------------------- */
 
 (async () => {
-    fs.mkdirSync(DOCS, { recursive: true });
     const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zkv-e2e-'));
-    const vault = createVaultServer({ dataDir });
+    const vault = createServer({ dataDir });
     await new Promise((r) => vault.server.listen(0, '127.0.0.1', r));
     const origin = 'http://127.0.0.1:' + vault.server.address().port;
-    console.log('server ' + origin);
 
     const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zkv-chrome-'));
     const chrome = spawn(CHROME, [
         '--headless=new', '--disable-gpu', '--no-first-run', '--no-default-browser-check',
-        '--hide-scrollbars', '--remote-debugging-port=9334', '--user-data-dir=' + userDataDir, 'about:blank'
+        '--hide-scrollbars', '--remote-debugging-port=' + PORT_DEBUG, '--user-data-dir=' + userDataDir, 'about:blank'
     ], { stdio: 'ignore' });
 
-    let failures = 0;
+    let fails = 0;
     const check = (cond, label, extra = '') => {
         console.log((cond ? '  ok   ' : '  FAIL ') + label + (extra ? '  -> ' + extra : ''));
-        if (!cond) failures++;
+        if (!cond) fails++;
     };
 
     const tabs = [];
+
     try {
-        let version = null;
-        for (let i = 0; i < 60 && !version; i++) {
-            try { version = await (await fetch('http://127.0.0.1:9334/json/version')).json(); }
+        for (let i = 0; i < 60; i++) {
+            try { await fetch('http://127.0.0.1:' + PORT_DEBUG + '/json/version'); break; }
             catch { await sleep(250); }
         }
-        if (!version) throw new Error('Chrome không mở được cổng debugging');
-        console.log('chrome ' + version.Browser);
 
-        const page = await openTab(origin + '/');
-        tabs.push(page.ws);
-        const { cdp } = page;
+        /* -------- gửi -------- */
+        const sendPage = await openTab(origin + '/');
+        tabs.push(sendPage.ws);
+        const cdp = sendPage.cdp;
 
-        check(await cdp.eval('!!window.ZKCrypto && !!window.ZKKeycode'), 'thư viện client đã nạp');
-        check(await cdp.eval(`document.getElementById('sendBtn').disabled`), 'nút gửi bị khoá khi chưa chọn tệp');
-        await cdp.send('Network.enable');
+        check(await cdp.eval('!!window.ZKCrypto && !!window.ZKKeycode'), 'trang nạp được thư viện mã hoá');
+        check(await cdp.eval(`document.getElementById('send').disabled`), 'nút gửi bị khoá khi chưa nhập gì');
 
-        /* ---------- kịch bản 1: gửi tệp văn bản ---------- */
-        const textContent = 'Hợp đồng thuê nhà số 42 — giá 12 triệu/tháng 🔐';
-        await cdp.eval(`
-            (function(){
-                const dt = new DataTransfer();
-                dt.items.add(new File([${JSON.stringify(textContent)}], 'hop-dong.txt', { type: 'text/plain' }));
-                document.getElementById('dropZone').dispatchEvent(new DragEvent('drop', { dataTransfer: dt, bubbles: true }));
-            })()
-        `);
-        check(await cdp.eval(`!document.getElementById('sendBtn').disabled`), 'thả tệp xong thì nút gửi bật');
-        check((await cdp.eval(`document.getElementById('fileChip').textContent`)).includes('hop-dong.txt'),
-            'hiện đúng tên tệp đã chọn');
+        const tooLong = Array.from({ length: 201 }, (_, i) => 'tu' + i).join(' ');
+        await cdp.eval(`(function(){const el=document.getElementById('plain');el.value=${JSON.stringify(tooLong)};el.dispatchEvent(new Event('input'));})()`);
+        check(await cdp.eval(`document.getElementById('send').disabled`), 'vượt 200 từ thì không gửi được');
+        check((await cdp.eval(`document.getElementById('counter').textContent`)) === '201/200 từ', 'bộ đếm báo 201/200 từ');
 
-        await cdp.eval(`document.getElementById('sendBtn').click()`);
-        check(await cdp.waitFor(`!document.getElementById('keyBox').hidden`), 'mã hoá + upload xong, hiện key');
+        const text = 'Mã dự phòng két sắt: 4821. Hạn đổi ngày 30/11. Ai đọc được nhớ huỷ sau khi dùng.';
+        await cdp.eval(`(function(){const el=document.getElementById('plain');el.value=${JSON.stringify(text)};el.dispatchEvent(new Event('input'));})()`);
+        check(!(await cdp.eval(`document.getElementById('send').disabled`)), 'nhập text hợp lệ thì bật nút gửi');
 
-        const keyText = await cdp.eval(`document.getElementById('keyValue').textContent`);
-        check(/^ZKV1(-[0-9A-HJKMNP-TV-Z]{4}){14}$/.test(keyText), 'key đúng định dạng ZKV1-…', keyText.slice(0, 22) + '…');
-        check(await cdp.eval(`document.getElementById('sendStatus').textContent.includes('Đã lưu')`), 'báo trạng thái đã lưu');
+        await cdp.eval(`document.getElementById('send').click()`);
+        check(await cdp.waitFor(`!document.getElementById('keyBox').hidden`), 'mã hoá và lưu xong, hiện key');
 
-        await capture(cdp, path.join(DOCS, 'screenshot-app-send.png'));
+        const keyText = await cdp.eval(`document.getElementById('keyOut').textContent`);
+        check(/^ZKV1(-[0-9A-HJKMNP-TV-Z]{4}){14}$/.test(keyText), 'key đúng định dạng', keyText.slice(0, 22) + '…');
 
-        /* ---------- kịch bản 2: tab khác mở bằng key ---------- */
-        const tab2 = await openTab(origin + '/');
-        tabs.push(tab2.ws);
-        await tab2.cdp.eval(`document.getElementById('tab-open').click()`);
-        await tab2.cdp.eval(`(function(){ const el = document.getElementById('keyInput'); el.value = ${JSON.stringify(keyText)}; el.dispatchEvent(new Event('input')); })()`);
-        check(await tab2.cdp.eval(`document.getElementById('keyInput').classList.contains('valid')`), 'ô key báo hợp lệ khi dán');
+        await shot(cdp, path.join(DOCS, 'screenshot-send.png'));
 
-        await tab2.cdp.eval(`document.getElementById('openBtn').click()`);
-        check(await tab2.cdp.waitFor(`!document.getElementById('resultBox').hidden`), 'mở khoá thành công ở tab mới');
+        /* -------- nhận -------- */
+        const recvPage = await openTab(origin + '/');
+        tabs.push(recvPage.ws);
 
-        const name = await tab2.cdp.eval(`document.getElementById('resultName').textContent`);
-        check(name === 'hop-dong.txt', 'lấy đúng tên tệp gốc', name);
+        await recvPage.cdp.eval(`(function(){const el=document.getElementById('keyIn');el.value=${JSON.stringify(keyText)};el.dispatchEvent(new Event('input'));})()`);
+        check(await recvPage.cdp.waitFor(`!document.getElementById('result').hidden`), 'dán key là tự động mở (không bấm nút)');
+        check((await recvPage.cdp.eval(`document.getElementById('textOut').textContent`)) === text, 'trả về đúng văn bản gốc');
 
-        const preview = await tab2.cdp.eval(`document.getElementById('resultPreview').textContent`);
-        check(preview.includes('Hợp đồng thuê nhà'), 'xem trước đúng nội dung đã giải mã');
+        await shot(recvPage.cdp, path.join(DOCS, 'screenshot-open.png'));
 
-        await capture(tab2.cdp, path.join(DOCS, 'screenshot-app-open.png'));
+        /* -------- key sai -------- */
+        const broken = keyText.slice(0, 10) + (keyText[10] === 'A' ? 'B' : 'A') + keyText.slice(11);
+        await recvPage.cdp.eval(`(function(){const el=document.getElementById('keyIn');el.value=${JSON.stringify(broken)};el.dispatchEvent(new Event('input'));})()`);
+        await sleep(500);
+        check(await recvPage.cdp.eval(`document.getElementById('result').hidden`), 'key gõ sai thì không hiện gì');
+        check(/checksum/i.test(await recvPage.cdp.eval(`document.getElementById('recvMsg').textContent`)), 'báo rõ là key gõ sai');
 
-        /* ---------- kịch bản 3: gõ sai key ---------- */
-        const brokenKey = keyText.slice(0, 10) + (keyText[10] === 'A' ? 'B' : 'A') + keyText.slice(11);
-        await tab2.cdp.eval(`(function(){ const el = document.getElementById('keyInput'); el.value = ${JSON.stringify(brokenKey)}; el.dispatchEvent(new Event('input')); })()`);
-        await tab2.cdp.eval(`document.getElementById('openBtn').click()`);
-        await tab2.cdp.waitFor(`document.getElementById('openStatus').textContent.includes('checksum')`);
-        const typoMsg = await tab2.cdp.eval(`document.getElementById('openStatus').textContent`);
-        check(/checksum|sai/i.test(typoMsg), 'gõ sai 1 ký tự bị bắt ngay', typoMsg.slice(0, 60));
+        /* -------- lỗi JS -------- */
+        const errors = cdp.errors.concat(recvPage.cdp.errors);
+        check(errors.length === 0, 'không có lỗi JS', errors[0] || '');
 
-        /* ---------- kịch bản 4: ảnh + tự huỷ ---------- */
-        const tab3 = await openTab(origin + '/');
-        tabs.push(tab3.ws);
-        await tab3.cdp.eval(`
-            (function(){
-                document.getElementById('burnCheck').checked = true;
-                const dt = new DataTransfer();
-                dt.items.add(new File([new Uint8Array(${JSON.stringify(Array.from(PNG_1x1))})], 'anh.png', { type: 'image/png' }));
-                document.getElementById('dropZone').dispatchEvent(new DragEvent('drop', { dataTransfer: dt, bubbles: true }));
-            })()
-        `);
-        await tab3.cdp.eval(`document.getElementById('sendBtn').click()`);
-        check(await tab3.cdp.waitFor(`!document.getElementById('keyBox').hidden`), 'gửi ảnh ở chế độ tự huỷ');
-        const pngKey = await tab3.cdp.eval(`document.getElementById('keyValue').textContent`);
-
-        const tab4 = await openTab(origin + '/');
-        tabs.push(tab4.ws);
-        const openWith = async (key) => {
-            await tab4.cdp.eval(`document.getElementById('tab-open').click()`);
-            await tab4.cdp.eval(`(function(){ const el = document.getElementById('keyInput'); el.value = ${JSON.stringify(key)}; el.dispatchEvent(new Event('input')); })()`);
-            await tab4.cdp.eval(`document.getElementById('openBtn').click()`);
-            await sleep(1200);
-        };
-
-        await openWith(pngKey);
-        check(await tab4.cdp.eval(`!!document.querySelector('#resultPreview img')`), 'ảnh được xem trước trực tiếp');
-        check(await tab4.cdp.eval(`document.querySelector('#resultPreview img').naturalWidth === 1`), 'ảnh giải mã đúng kích thước gốc');
-
-        const firstStatus = await tab4.cdp.eval(`document.getElementById('openStatus').textContent`);
-        check(/xoá khỏi server/i.test(firstStatus), 'báo tệp đã tự huỷ sau lần tải đầu', firstStatus.slice(0, 70));
-
-        await tab4.cdp.eval(`document.getElementById('openBtn').click()`);
-        await sleep(1200);
-        const secondStatus = await tab4.cdp.eval(`document.getElementById('openStatus').textContent`);
-        check(/không tìm thấy|hết hạn|tải đủ số lần/i.test(secondStatus), 'lần tải thứ hai bị từ chối', secondStatus.slice(0, 70));
-
-        /* ---------- không có lỗi console/CSP nào ngoài 404 có chủ đích ---------- */
-        const allErrors = [].concat(cdp.errors, tab2.cdp.errors, tab3.cdp.errors, tab4.cdp.errors);
-        const network404 = allErrors.filter((e) => e.startsWith('HTTP 404 '));
-        const consoleErrors = allErrors.filter((e) => !e.startsWith('HTTP ') && !/status of 404/i.test(e));
-
-        check(network404.every((e) => e.includes('/api/blob')),
-            'mọi HTTP 404 đều là /api/blob (nhánh tệp đã tự huỷ)',
-            network404.join(' | ') || 'không có 404 nào');
-        check(consoleErrors.length === 0, 'không có lỗi JS/CSP nào', consoleErrors.slice(0, 3).join(' | '));
-
-        console.log(failures ? '\n' + failures + ' kiểm tra THẤT BẠI' : '\nTất cả kiểm tra đều đạt');
-        process.exitCode = failures ? 1 : 0;
+        console.log(fails ? '\n' + fails + ' kiểm tra THẤT BẠI' : '\nTất cả kiểm tra đều đạt');
+        process.exitCode = fails ? 1 : 0;
     } catch (err) {
         console.error('LỖI:', err.message);
         process.exitCode = 1;
     } finally {
-        for (const ws of tabs) { try { ws.close(); } catch { /* ignore */ } }
+        for (const ws of tabs) { try { ws.close(); } catch { /* bỏ qua */ } }
         chrome.kill();
         await new Promise((r) => vault.server.close(r));
         fs.rmSync(dataDir, { recursive: true, force: true });
-        await sleep(300);
     }
 })();
