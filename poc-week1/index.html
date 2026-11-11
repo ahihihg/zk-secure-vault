@@ -7,33 +7,50 @@
     <style>
         body {
             font-family: system-ui, sans-serif;
-            max-width: 600px;
+            max-width: 650px;
             margin: 40px auto;
             padding: 0 16px;
+            line-height: 1.5;
         }
 
         textarea,
         input {
             width: 100%;
-            padding: 8px;
+            padding: 10px;
             margin: 8px 0;
             box-sizing: border-box;
+            border: 1px solid #ccc;
+            border-radius: 4px;
         }
 
         button {
-            padding: 8px 16px;
+            padding: 10px 16px;
             cursor: pointer;
             background: #0066cc;
             color: #fff;
             border: none;
             border-radius: 4px;
+            font-weight: 600;
+        }
+
+        button:hover {
+            background: #0052a3;
         }
 
         .card {
             border: 1px solid #ddd;
-            padding: 16px;
+            padding: 20px;
             border-radius: 8px;
-            margin-bottom: 16px;
+            margin-bottom: 20px;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05);
+        }
+
+        .result-box {
+            background: #f4f8f4;
+            border-left: 4px solid #28a745;
+            padding: 12px;
+            margin-top: 12px;
+            word-break: break-all;
         }
     </style>
 </head>
@@ -42,22 +59,25 @@
     <h2>Zero-Knowledge Text Secret PoC</h2>
 
     <div class="card">
-        <h3>1. Tạo Secret</h3>
+        <h3>1. Người gửi: Tạo Secret & Link chia sẻ</h3>
         <textarea id="secretInput" rows="3" placeholder="Nhập API key, mật khẩu hoặc ghi chú bí mật..."></textarea>
-        <button onclick="encryptText()">Mã hóa & Tạo Link (#key)</button>
-        <input type="text" id="shareLink" readonly placeholder="Link chia sẻ sẽ hiện ở đây..." />
+        <button onclick="encryptText()">Mã hóa & Tạo Link chia sẻ</button>
+        <p style="margin-bottom: 4px; font-size: 14px; color: #555;">Copy link này gửi sang tab ẩn danh hoặc trình duyệt
+            khác:</p>
+        <input type="text" id="shareLink" readonly placeholder="Link chia sẻ sẽ hiện ở đây..."
+            onclick="this.select()" />
     </div>
 
     <div class="card">
-        <h3>2. Giải mã từ URL Hash</h3>
-        <button onclick="decryptText()">Giải mã ngay</button>
-        <p><strong>Nội dung gốc:</strong> <span id="decryptedOutput" style="color: green; font-weight: bold;"></span>
-        </p>
+        <h3>2. Người nhận: Giải mã từ Link</h3>
+        <button onclick="decryptFromUrl()">Giải mã dữ liệu từ URL</button>
+        <div class="result-box">
+            <strong>Nội dung gốc:</strong> <span id="decryptedOutput" style="color: #155724; font-weight: bold;">(Chưa
+                giải mã)</span>
+        </div>
     </div>
 
     <script>
-        let serverCiphertextMock = null; // Giả lập bản mã lưu trên server
-
         const toBase64Url = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf)))
             .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 
@@ -76,36 +96,53 @@
             const iv = crypto.getRandomValues(new Uint8Array(12));
             const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, encoded);
 
-            // Gộp [12B IV + Ciphertext]
+            // Đóng gói [12B IV + Ciphertext]
             const combined = new Uint8Array(iv.length + ciphertext.byteLength);
             combined.set(iv, 0);
             combined.set(new Uint8Array(ciphertext), iv.length);
-            serverCiphertextMock = combined.buffer;
 
+            const payloadB64 = toBase64Url(combined.buffer);
             const rawKey = await crypto.subtle.exportKey('raw', key);
-            const keyHash = toBase64Url(rawKey);
+            const keyB64 = toBase64Url(rawKey);
 
-            window.location.hash = keyHash;
-            document.getElementById('shareLink').value = window.location.href;
+            // Tạo URL hoàn chỉnh chứa cả ?payload (bản mã) và #key (khóa giải mã)
+            const baseUrl = window.location.origin + window.location.pathname;
+            const fullShareUrl = `${baseUrl}?payload=${payloadB64}#${keyB64}`;
+
+            document.getElementById('shareLink').value = fullShareUrl;
+            window.history.replaceState(null, '', `?payload=${payloadB64}#${keyB64}`);
         }
 
-        async function decryptText() {
-            if (!serverCiphertextMock) return alert('Chưa có bản mã!');
-            const keyHash = window.location.hash.substring(1);
-            if (!keyHash) return alert('Không tìm thấy key trên URL hash!');
+        async function decryptFromUrl() {
+            const params = new URLSearchParams(window.location.search);
+            const payloadB64 = params.get('payload');
+            const keyB64 = window.location.hash.substring(1);
+
+            if (!payloadB64 || !keyB64) {
+                return alert('URL chưa có đủ bản mã (?payload=...) hoặc khóa giải mã (#key)!');
+            }
 
             try {
-                const key = await crypto.subtle.importKey('raw', fromBase64Url(keyHash), { name: 'AES-GCM' }, false, ['decrypt']);
-                const data = new Uint8Array(serverCiphertextMock);
-                const iv = data.slice(0, 12);
-                const ciphertext = data.slice(12);
+                const key = await crypto.subtle.importKey('raw', fromBase64Url(keyB64), { name: 'AES-GCM' }, false, ['decrypt']);
+                const combined = new Uint8Array(fromBase64Url(payloadB64));
+                const iv = combined.slice(0, 12);
+                const ciphertext = combined.slice(12);
 
                 const decrypted = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ciphertext);
                 document.getElementById('decryptedOutput').textContent = new TextDecoder().decode(decrypted);
             } catch (e) {
-                alert('Giải mã thất bại! Key trên URL đã bị sai.');
+                document.getElementById('decryptedOutput').textContent = 'Lỗi: Sai khóa hoặc bản mã đã bị can thiệp!';
+                document.getElementById('decryptedOutput').style.color = 'red';
             }
         }
+
+        // Tự động giải mã ngay khi người nhận mở link có sẵn payload và hash
+        window.addEventListener('DOMContentLoaded', () => {
+            const params = new URLSearchParams(window.location.search);
+            if (params.get('payload') && window.location.hash.length > 1) {
+                decryptFromUrl();
+            }
+        });
     </script>
 </body>
 
