@@ -100,7 +100,9 @@
 
         // 2 bit đệm cuối phải bằng 0, nếu không thì đây không phải key do hệ thống sinh ra
         if (bits > 0 && acc !== 0) {
-            throw new KeyFormatError('Key không hợp lệ: bit đệm khác 0.');
+            throw new KeyFormatError(
+                'Key bị sai ở ký tự cuối (hoặc đã bị cắt cụt). Hãy dán lại nguyên key thay vì gõ tay.'
+            );
         }
         return out.slice(0, o);
     }

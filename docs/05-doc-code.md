@@ -111,7 +111,7 @@ Kiểm tra theo thứ tự:
 | rỗng | "Chưa nhập key." |
 | độ dài ≠ 43 | "Key phải có 43 ký tự (không tính tiền tố)…" |
 | ký tự ngoài bảng Base64URL | "Ký tự không hợp lệ trong key…" |
-| bit đệm ≠ 0 | "Key không hợp lệ: bit đệm khác 0." |
+| bit đệm ≠ 0 | "Key bị sai ở ký tự cuối (hoặc đã bị cắt cụt)…" |
 
 ### `normalize(input)` — [src/keycode.js:127](../src/keycode.js#L127)
 
