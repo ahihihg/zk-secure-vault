@@ -96,31 +96,30 @@ biệt được — và việc tách hai thông báo khác nhau sẽ tạo ra m�
 
 ## src/keycode.js
 
-### `encode(bytes)` — [src/keycode.js:135](../src/keycode.js#L135)
+### `encode(bytes)` — [src/keycode.js:113](../src/keycode.js#L113)
 
 ```
-32 byte → Base32 (52 ký tự) → thêm 4 ký tự checksum → chia nhóm 4 → "ZKV1-…"
+32 byte → Base64URL (43 ký tự) → gắn tiền tố → "ZKV1-…"
 ```
 
-### `decode(text)` — [src/keycode.js:169](../src/keycode.js#L169)
+### `decode(text)` — [src/keycode.js:139](../src/keycode.js#L139)
 
 Kiểm tra theo thứ tự:
 
 | Bước | Nếu sai |
 |---|---|
 | rỗng | "Chưa nhập key." |
-| độ dài ≠ 56 | "Key phải có 56 ký tự, bạn nhập N…" |
-| checksum | "Key bị gõ sai (checksum không khớp)…" |
-| bit đệm ≠ 0 | "Key không hợp lệ: bit đệm phải bằng 0." |
+| độ dài ≠ 43 | "Key phải có 43 ký tự (không tính tiền tố)…" |
+| ký tự ngoài bảng Base64URL | "Ký tự không hợp lệ trong key…" |
+| bit đệm ≠ 0 | "Key không hợp lệ: bit đệm khác 0." |
 
-### `normalize(input)` — [src/keycode.js:155](../src/keycode.js#L155)
+### `normalize(input)` — [src/keycode.js:127](../src/keycode.js#L127)
 
-Hai chi tiết dễ sửa hỏng:
+Chỉ làm hai việc: bỏ khoảng trắng (kể cả xuống dòng khi copy) và bỏ tiền tố `ZKV1-`.
 
-1. Đổi `O→0`, `I/L→1` **trước** khi bỏ tiền tố — nếu không, `ZKVL-…` (chữ L thay cho số 1)
-   sẽ không được nhận ra là `ZKV1-…`.
-2. Chỉ bỏ tiền tố khi chuỗi **dài hơn** 56 ký tự, nếu không sẽ cắt nhầm dữ liệu thật trong
-   trường hợp key không có tiền tố mà tình cờ bắt đầu bằng `ZKV1`.
+Điều **không** làm: không đổi hoa/thường và không bỏ dấu `-` trong phần dữ liệu,
+vì cả hai đều mang thông tin. Đó cũng là lý do key không chia nhóm bằng gạch nối
+như các định dạng thân thiện với người đọc khác.
 
 ---
 
@@ -209,6 +208,6 @@ Biến `lastKey` chặn việc gọi lại API liên tục khi văn bản trong 
 |---|---|
 | Chuỗi miền `"zkv1/id"` | cùng lúc ở client và server, nếu không sẽ không tìm thấy dữ liệu |
 | `HEADER_BYTES` | phần ghép và tách IV trong `encryptText` / `decryptText` |
-| Bỏ checksum trong keycode | không còn báo được "gõ sai", chỉ còn "sai key hoặc hỏng" |
+| Đổi bảng chữ cái của key | key dài thêm 13 ký tự nếu quay lại Base32; phải sửa `encode`/`decode` và mọi chỗ hiển thị key |
 | Đổi `additionalData` | cả `encryptText` và `decryptText` phải đổi giống nhau |
 | Thêm endpoint mới | nhớ kiểm `Authorization` và rate limit trước khi đọc body |

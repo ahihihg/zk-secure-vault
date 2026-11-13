@@ -90,7 +90,11 @@ async function openTab(url) {
     await cdp.send('Page.enable');
     await cdp.send('Runtime.enable');
     await cdp.send('Emulation.setDeviceMetricsOverride', { width: 1100, height: 820, deviceScaleFactor: 1, mobile: false });
-    await sleep(600);
+
+    // Điều hướng tường minh: không dựa vào /json/new?url= (hành vi khác nhau giữa các bản Chrome)
+    await cdp.send('Page.navigate', { url });
+    await sleep(1000);
+
     return { cdp, ws };
 }
 
@@ -149,7 +153,7 @@ async function shot(cdp, file) {
         check(await cdp.waitFor(`!document.getElementById('keyBox').hidden`), 'mã hoá và lưu xong, hiện key');
 
         const keyText = await cdp.eval(`document.getElementById('keyOut').textContent`);
-        check(/^ZKV1(-[0-9A-HJKMNP-TV-Z]{4}){14}$/.test(keyText), 'key đúng định dạng', keyText.slice(0, 22) + '…');
+        check(/^ZKV1-[A-Za-z0-9_-]{43}$/.test(keyText), 'key đúng định dạng', keyText.slice(0, 22) + '…');
 
         await shot(cdp, path.join(DOCS, 'screenshot-send.png'));
 
@@ -168,7 +172,7 @@ async function shot(cdp, file) {
         await recvPage.cdp.eval(`(function(){const el=document.getElementById('keyIn');el.value=${JSON.stringify(broken)};el.dispatchEvent(new Event('input'));})()`);
         await sleep(500);
         check(await recvPage.cdp.eval(`document.getElementById('result').hidden`), 'key gõ sai thì không hiện gì');
-        check(/checksum/i.test(await recvPage.cdp.eval(`document.getElementById('recvMsg').textContent`)), 'báo rõ là key gõ sai');
+        check(/không tìm thấy|43 ký tự|không hợp lệ/i.test(await recvPage.cdp.eval(`document.getElementById('recvMsg').textContent`)), 'báo rõ là key không dùng được');
 
         /* -------- lỗi JS -------- */
         const errors = cdp.errors.concat(recvPage.cdp.errors);

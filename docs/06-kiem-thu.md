@@ -23,19 +23,18 @@ người dùng (gõ text, bấm nút, dán key ở tab khác) rồi chụp ảnh
 
 ## Ba nhóm test
 
-### `test/keycode.test.js` — 10 test
+### `test/keycode.test.js` — 11 test
 
 Kiểm tra cách key được sinh và đọc lại.
 
 | Test | Bảo vệ điều gì |
 |---|---|
-| hình dạng `ZKV1-xxxx-…` | giao diện người dùng không đổi ngoài ý muốn |
+| hình dạng `ZKV1-` + 43 ký tự | giao diện người dùng không đổi ngoài ý muốn |
 | roundtrip 200 key ngẫu nhiên | encode/decode không mất bit |
-| đủ kiểu định dạng lộn xộn | dán từ đâu cũng đọc được (chữ hoa, có dấu cách, thiếu gạch) |
-| tự sửa `O→0`, `I/L→1` | người đọc key từ giấy không bị chặn oan |
-| gõ sai 1 ký tự | checksum bắt được |
+| khoảng trắng / thiếu tiền tố | dán từ đâu cũng đọc được |
+| phân biệt hoa thường | đổi hoa/thường cho ra key khác, không lặng lẽ trùng |
 | thiếu ký tự | báo đúng số lượng |
-| ký tự lạ | nằm ngoài bảng Crockford thì từ chối |
+| ký tự ngoài bảng Base64URL | từ chối ngay trên máy khách |
 | key rỗng / `null` | không ném lỗi khó hiểu |
 | `isValid` | không ném exception ra ngoài |
 | key sai độ dài | `encode` từ chối |
@@ -119,10 +118,13 @@ console.log('đã sửa 1 bit của', r.id);
 Mở lại đúng key đó trên trình duyệt → *"Sai key hoặc dữ liệu đã bị thay đổi (thẻ xác thực
 không khớp)."* Đây là GHASH đang làm việc.
 
-### 3. Key gõ sai bị bắt trước khi gửi request
+### 3. Key sai định dạng bị bắt trước khi gửi request
 
-Dán key vào ô nhưng xoá 1 ký tự → báo *"checksum không khớp"* **ngay lập tức**, không có
-request nào được gửi (kiểm tra ở tab Network của DevTools).
+Dán key thiếu ký tự hoặc có ký tự lạ (ví dụ `+` hay `=`) → báo lỗi **ngay lập tức**,
+không có request nào được gửi (kiểm tra ở tab Network của DevTools).
+
+Còn nếu đủ 43 ký tự hợp lệ nhưng gõ sai một chữ, request vẫn được gửi và máy chủ trả
+`404` vì `id` băm ra khác. Đây là đánh đổi của việc bỏ checksum.
 
 ### 4. Chỉ request mã hoá rời khỏi máy
 

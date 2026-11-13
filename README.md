@@ -38,7 +38,7 @@ ciphertext vô nghĩa.
 ```
 src/
 ├── crypto.js     # lõi: HKDF dẫn xuất khoá + AES-256-GCM
-├── keycode.js    # key ZKV1-… : Crockford Base32 + checksum
+├── keycode.js    # key ZKV1-… : Base64URL, 43 ký tự
 └── server.js     # HTTP API + SQLite, zero-dependency
 public/
 ├── index.html    # giao diện hai cột: Gửi / Nhận

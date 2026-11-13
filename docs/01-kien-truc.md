@@ -49,7 +49,7 @@ do client gửi lên. Nếu không, kẻ tấn công có thể ghi đè bản m�
 Người nhận                                                 Server
 ──────────────────────────────────────────────────────────────────────
 1. dán key ZKV1-… vào ô
-   ├─ giải Base32 + kiểm checksum   (sai -> báo ngay, không gửi request)
+   ├─ giải Base64URL, đòi đúng 43 ký tự (sai -> báo ngay, chưa gửi request)
    ├─ authKey = HKDF(K, "auth")
    └─ GET /api/secret, Bearer authKey
                               ────────────────────►
@@ -104,6 +104,6 @@ tạo ──► tồn tại (tối đa 7 ngày) ──► hết hạn ──► 
 | Mã hoá ở client, không ở server | Server giữ khoá thì không còn zero-knowledge; một lần lộ DB là lộ tất |
 | `id` suy ra từ `authKey` | Server tra cứu được mà không cần biết key; không có bảng ánh xạ "key → id" để rò rỉ |
 | Một key, nhiều nhánh HKDF | Người dùng chỉ phải giữ một chuỗi, nhưng khoá mã hoá và khoá truy cập là hai thứ độc lập |
-| Key dạng Base32 + checksum | Người dùng phải chép tay chuỗi 74 ký tự; Base64URL dễ nhầm 0/O, 1/l |
+| Key dạng Base64URL | Ngắn (43 ký tự), cùng bảng chữ cái với header `Authorization`, đúng chuẩn RFC 4648 |
 | Dùng SQLite chứ không dùng file JSON | Cần xoá theo hạn, và BLOB tiện cho dữ liệu nhị phân |
 | Một khối GCM duy nhất | Với ≤ 200 từ (≈ 2 KB) chia khối chỉ làm code khó hiểu mà không thêm lợi ích |

@@ -117,7 +117,7 @@ Lấy `K` cố định là `00 01 02 … 1f` và văn bản `"Mã két sắt: 48
 
 ```
 K      : 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
-key    : ZKV1-000G-40R4-0M30-E209-185G-R38E-1W81-24GK-2GAH-C5RR-34D1-P70X-3RFG-MJCH
+key    : ZKV1-AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8
 
 encKey : 1b0e366b948dee6ddb01b0fe49a8b78b8b02fa483ec48e9724b86737f18ec82c
 authKey: 94dedb77a531cfb954f4313704da199f43f8683d92bdfadf74333bdd9114e6d8
@@ -145,24 +145,29 @@ Có thể tự kiểm chứng: [test/crypto.test.js](../test/crypto.test.js) có
 
 ## Bước 6 — Key người dùng nhìn thấy
 
-32 byte được mã hoá sang Base32 và thêm checksum:
+32 byte được mã hoá sang **Base64URL** (RFC 4648 §5) rồi gắn tiền tố cho dễ nhận ra:
 
 ```
-ZKV1-000G-40R4-0M30-E209-185G-R38E-1W81-24GK-2GAH-C5RR-34D1-P70X-3RFG-MJCH
-└──┘ └────────────────────── 56 ký tự ──────────────────────────────┘
-tiền tố          52 dữ liệu + 4 checksum
+ZKV1-3q2F9mW0tYb8sKcVx1nQzR7pJdLh4gAeUoXiT6NyP5w
+└──┘ └──────────── 43 ký tự Base64URL ────────────┘
+tiền tố               32 byte = 256 bit
 ```
 
-**Vì sao không dùng Base64URL:** bảng chữ cái Base64URL có `0` và `O`, `1` và `l`/`I` trông
-gần như nhau. Người dùng thường chép key ra giấy hoặc đọc qua điện thoại. Crockford Base32
-bỏ hẳn `I`, `L`, `O`, `U`, còn bộ chuẩn hoá tự đổi `O→0`, `I/L→1` khi đọc key vào.
+Bảng chữ cái `A–Z a–z 0–9 - _`, bỏ dấu `=` đệm. 32 byte cho ra 43 ký tự
+(43 × 6 = 258 bit, dư 2 bit đệm phải bằng 0 — điều kiện "canonical" của chuỗi).
 
-**Checksum:** 4 ký tự cuối = 20 bit đầu của CRC-32 trên 52 ký tự dữ liệu. Sai một ký tự là
-báo ngay "checksum không khớp", thay vì để người dùng nhận thông báo mơ hồ "sai key hoặc
-file hỏng".
+**Hai điều phải nhớ khi dùng Base64URL cho key:**
 
-Mã nguồn: [src/keycode.js:135](../src/keycode.js#L135) — `encode()`,
-[src/keycode.js:169](../src/keycode.js#L169) — `decode()`.
+1. Chuỗi **phân biệt hoa thường** — đổi `a` thành `A` là ra một key khác hoàn toàn.
+2. Bảng chữ cái đã chứa `-` và `_`, nên **không thể chia nhóm bằng gạch nối**.
+   Tiền tố `ZKV1-` chỉ để nhận ra đây là key, không phải dấu phân cách.
+
+**Không có checksum.** Key gõ sai nhưng vẫn đủ 43 ký tự hợp lệ sẽ giải mã ra một key
+khác, và máy chủ trả `404`. Đây là đánh đổi có chủ ý: lấy key ngắn hơn 13 ký tự và
+bớt một thuật toán.
+
+Mã nguồn: [src/keycode.js:113](../src/keycode.js#L113) — `encode()`,
+[src/keycode.js:139](../src/keycode.js#L139) — `decode()`.
 
 ## Những gì KHÔNG làm
 

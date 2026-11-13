@@ -106,7 +106,7 @@ const container = Buffer.from(
 const res = await fetch('http://127.0.0.1:8787/api/secret', {
     method: 'POST',
     headers: {
-        // authKey ứng với key ZKV1-000G-40R4-… ở tài liệu 02
+        // authKey ứng với key ZKV1-AAECAwQF… ở tài liệu 02
         'Authorization': 'Bearer lN7bd6Uxz7lU9DE3BNoZn0P4aD2SvfrfdDM73ZEU5tg',
         'Content-Type': 'application/octet-stream'
     },

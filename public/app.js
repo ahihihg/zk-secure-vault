@@ -196,7 +196,7 @@
             if (value.trim() === '') {
                 setMsg('recv', null);
             } else {
-                // Hiện đúng lý do: thiếu ký tự, checksum lệch, hay ký tự lạ
+                // Hiện đúng lý do: thiếu ký tự, sai bảng chữ cái, hay bit đệm khác 0
                 try {
                     ZKKeycode.decode(value);
                 } catch (err) {
