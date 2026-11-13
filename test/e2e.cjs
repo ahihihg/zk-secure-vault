@@ -139,6 +139,8 @@ async function shot(cdp, file) {
 
         check(await cdp.eval('!!window.ZKCrypto && !!window.ZKKeycode'), 'trang nạp được thư viện mã hoá');
         check(await cdp.eval(`document.getElementById('send').disabled`), 'nút gửi bị khoá khi chưa nhập gì');
+        check((await cdp.eval(`getComputedStyle(document.getElementById('keyIn')).textTransform`)) === 'none',
+            'ô nhập key không bị CSS đổi hoa/thường');
 
         const tooLong = Array.from({ length: 201 }, (_, i) => 'tu' + i).join(' ');
         await cdp.eval(`(function(){const el=document.getElementById('plain');el.value=${JSON.stringify(tooLong)};el.dispatchEvent(new Event('input'));})()`);
