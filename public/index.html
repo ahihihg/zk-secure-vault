@@ -60,6 +60,20 @@
                 <div class="result" id="result" hidden>
                     <div class="label">Văn bản gốc</div>
                     <div class="text" id="textOut"></div>
+                    <div class="row" id="resultActions">
+                        <button class="ghost" id="editBtn" type="button">Sửa nội dung</button>
+                        <button class="danger" id="delBtn" type="button">Xoá văn bản</button>
+                    </div>
+                    <div class="edit-box" id="editBox" hidden>
+                        <label class="label" for="editPlain">Sửa văn bản (giữ nguyên key)</label>
+                        <textarea id="editPlain" rows="5" spellcheck="false"
+                            placeholder="Nhập nội dung mới…"></textarea>
+                        <div class="row">
+                            <span class="counter" id="editCounter">0/200 từ</span>
+                            <button class="ghost" id="cancelEditBtn" type="button">Huỷ</button>
+                            <button class="primary" id="saveEditBtn" type="button">Lưu thay đổi</button>
+                        </div>
+                    </div>
                 </div>
             </section>
 

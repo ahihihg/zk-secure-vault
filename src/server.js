@@ -11,9 +11,11 @@
  * Nó không có bảng user, không có mật khẩu, không có `encKey`, không log nội dung.
  *
  * API
- *   POST /api/secret   Authorization: Bearer <authKey>   body: gói tin ZKV1
- *   GET  /api/secret   Authorization: Bearer <authKey>
- *   GET  /api/health
+ *   POST   /api/secret   Authorization: Bearer <authKey>   body: gói tin ZKV1 (tạo mới / ghi đè)
+ *   GET    /api/secret   Authorization: Bearer <authKey>
+ *   PUT    /api/secret   Authorization: Bearer <authKey>   body: gói tin ZKV1 (sửa bản mã hiện có)
+ *   DELETE /api/secret   Authorization: Bearer <authKey>
+ *   GET    /api/health
  */
 'use strict';
 
@@ -267,6 +269,75 @@ function createServer(options = {}) {
         return undefined;
     }
 
+    async function handlePut(req, res) {
+        if (limited(clientIp(req), 'post')) {
+            return fail(res, 429, 'RATE_LIMITED', 'Bạn gửi quá nhiều. Thử lại sau một phút.');
+        }
+
+        const token = tokenFrom(req);
+        if (!token) return fail(res, 401, 'UNAUTHORIZED', 'Thiếu hoặc sai header Authorization.');
+        const id = idFromAuthKey(token);
+        if (!id) return fail(res, 401, 'UNAUTHORIZED', 'authKey không hợp lệ.');
+
+        const row = qGet.get(id);
+        if (!row) {
+            return fail(res, 404, 'NOT_FOUND', 'Không tìm thấy văn bản với key này (hoặc đã hết hạn).');
+        }
+        if (row.expires_at <= now()) {
+            qDel.run(id);
+            return fail(res, 404, 'EXPIRED', 'Văn bản đã hết hạn và bị xoá khỏi server.');
+        }
+
+        let body;
+        try {
+            body = await readBody(req, cfg.maxBytes);
+        } catch (err) {
+            const payload = Buffer.from(JSON.stringify({ error: 'PAYLOAD_TOO_LARGE', message: err.message }));
+            res.writeHead(413, {
+                ...SECURITY_HEADERS,
+                'Content-Type': 'application/json; charset=utf-8',
+                'Content-Length': payload.length,
+                'Cache-Control': 'no-store',
+                'Connection': 'close'
+            });
+            res.end(payload, () => req.destroy());
+            return undefined;
+        }
+
+        if (body.length < MIN_CONTAINER_BYTES) {
+            return fail(res, 400, 'BAD_CONTAINER', 'Dữ liệu quá ngắn để là một gói tin ZK-Vault.');
+        }
+
+        const updatedAt = now();
+        const expiresAt = updatedAt + cfg.ttlSeconds * 1000;
+        qPut.run(id, body, updatedAt, expiresAt);
+
+        return json(res, 200, { ok: true, id, size: body.length, expiresAt });
+    }
+
+    function handleDelete(req, res) {
+        if (limited(clientIp(req), 'post')) {
+            return fail(res, 429, 'RATE_LIMITED', 'Bạn gửi quá nhiều. Thử lại sau một phút.');
+        }
+
+        const token = tokenFrom(req);
+        if (!token) return fail(res, 401, 'UNAUTHORIZED', 'Thiếu hoặc sai header Authorization.');
+        const id = idFromAuthKey(token);
+        if (!id) return fail(res, 401, 'UNAUTHORIZED', 'authKey không hợp lệ.');
+
+        const row = qGet.get(id);
+        if (!row) {
+            return fail(res, 404, 'NOT_FOUND', 'Không tìm thấy văn bản với key này (hoặc đã hết hạn).');
+        }
+        if (row.expires_at <= now()) {
+            qDel.run(id);
+            return fail(res, 404, 'EXPIRED', 'Văn bản đã hết hạn và bị xoá khỏi server.');
+        }
+
+        qDel.run(id);
+        return json(res, 200, { ok: true, id });
+    }
+
     /* ---------------- file tĩnh ---------------- */
 
     // Dùng chung thư viện mã hoá ở src/ thay vì copy sang public/
@@ -318,7 +389,9 @@ function createServer(options = {}) {
             if (pathname === '/api/secret') {
                 if (req.method === 'POST') return await handlePost(req, res);
                 if (req.method === 'GET') return handleGet(req, res);
-                res.setHeader('Allow', 'GET, POST');
+                if (req.method === 'PUT') return await handlePut(req, res);
+                if (req.method === 'DELETE') return handleDelete(req, res);
+                res.setHeader('Allow', 'GET, POST, PUT, DELETE');
                 return fail(res, 405, 'METHOD_NOT_ALLOWED', 'Phương thức không được hỗ trợ.');
             }
             if (pathname.startsWith('/api/')) {

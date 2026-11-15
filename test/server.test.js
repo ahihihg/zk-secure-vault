@@ -249,3 +249,70 @@ test('thư viện dùng chung được phục vụ từ src/', async () => {
         await s.close();
     }
 });
+
+test('PUT /api/secret sửa lại văn bản theo cùng key (IV mới)', async () => {
+    const s = await startServer();
+    try {
+        const rootKey = zk.randomKey();
+        const v1 = await zk.encryptText('nội dung ban đầu', rootKey);
+
+        const postRes = await fetch(s.base + '/api/secret', {
+            method: 'POST', headers: auth(v1.authKeyB64), body: v1.container
+        });
+        assert.equal(postRes.status, 201);
+
+        const v2 = await zk.encryptText('nội dung đã chỉnh sửa lần 2', rootKey);
+        assert.equal(v2.id, v1.id);
+        // IV 12 byte ở vị trí [1..13] phải khác nhau giữa 2 lần mã hoá
+        assert.notDeepEqual(v1.container.slice(1, 13), v2.container.slice(1, 13));
+
+        const putRes = await fetch(s.base + '/api/secret', {
+            method: 'PUT', headers: auth(v2.authKeyB64), body: v2.container
+        });
+        assert.equal(putRes.status, 200);
+        const putInfo = await putRes.json();
+        assert.equal(putInfo.ok, true);
+        assert.equal(putInfo.id, v1.id);
+        assert.equal(putInfo.size, v2.container.length);
+
+        const getRes = await fetch(s.base + '/api/secret', { headers: auth(v1.authKeyB64) });
+        assert.equal(getRes.status, 200);
+        const container = new Uint8Array(await getRes.arrayBuffer());
+        assert.equal(await zk.decryptText(container, rootKey), 'nội dung đã chỉnh sửa lần 2');
+
+        // PUT với key chưa tồn tại -> 404
+        const unknown = await seal('không tồn tại');
+        const badPut = await fetch(s.base + '/api/secret', {
+            method: 'PUT', headers: auth(unknown.authKeyB64), body: unknown.container
+        });
+        assert.equal(badPut.status, 404);
+    } finally {
+        await s.close();
+    }
+});
+
+test('DELETE /api/secret xoá văn bản theo key', async () => {
+    const s = await startServer();
+    try {
+        const sealed = await seal('bí mật cần xoá ngay');
+        await fetch(s.base + '/api/secret', {
+            method: 'POST', headers: auth(sealed.authKeyB64), body: sealed.container
+        });
+
+        const delRes = await fetch(s.base + '/api/secret', {
+            method: 'DELETE', headers: auth(sealed.authKeyB64)
+        });
+        assert.equal(delRes.status, 200);
+        const delInfo = await delRes.json();
+        assert.equal(delInfo.ok, true);
+        assert.equal(delInfo.id, sealed.id);
+
+        // Đọc lại hoặc xoá lần 2 đều trả 404
+        assert.equal((await fetch(s.base + '/api/secret', { headers: auth(sealed.authKeyB64) })).status, 404);
+        assert.equal((await fetch(s.base + '/api/secret', {
+            method: 'DELETE', headers: auth(sealed.authKeyB64)
+        })).status, 404);
+    } finally {
+        await s.close();
+    }
+});

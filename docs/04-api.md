@@ -17,6 +17,8 @@ Authorization: Bearer <authKey Base64URL, 43 ký tự>
 |---|---|---|---|
 | `POST` | `/api/secret` | gói tin nhị phân (13 + n + 16 byte) | `201` + JSON |
 | `GET` | `/api/secret` | — | `200` + bytes gói tin |
+| `PUT` | `/api/secret` | gói tin nhị phân mới (13 + n + 16 byte) | `200` + JSON |
+| `DELETE` | `/api/secret` | — | `200` + JSON |
 | `GET` | `/api/health` | — | `200` + JSON |
 
 ## POST /api/secret

@@ -169,6 +169,20 @@ async function shot(cdp, file) {
 
         await shot(recvPage.cdp, path.join(DOCS, 'screenshot-open.png'));
 
+        /* -------- sửa văn bản theo key -------- */
+        const updatedText = 'Mã dự phòng két sắt mới: 9900 (đã cập nhật).';
+        await recvPage.cdp.eval(`document.getElementById('editBtn').click()`);
+        check(await recvPage.cdp.eval(`!document.getElementById('editBox').hidden`), 'bấm Sửa hiện ô chỉnh sửa');
+        await recvPage.cdp.eval(`(function(){const el=document.getElementById('editPlain');el.value=${JSON.stringify(updatedText)};el.dispatchEvent(new Event('input'));})()`);
+        await recvPage.cdp.eval(`document.getElementById('saveEditBtn').click()`);
+        check(await recvPage.cdp.waitFor(`document.getElementById('editBox').hidden && document.getElementById('textOut').textContent === ${JSON.stringify(updatedText)}`),
+            'lưu chỉnh sửa thành công và cập nhật nội dung hiển thị');
+
+        /* -------- xoá văn bản theo key -------- */
+        await recvPage.cdp.eval(`document.getElementById('delBtn').click()`);
+        check(await recvPage.cdp.waitFor(`document.getElementById('result').hidden`), 'xoá xong ẩn khung kết quả');
+        check(/Đã xoá văn bản/i.test(await recvPage.cdp.eval(`document.getElementById('recvMsg').textContent`)), 'thông báo đã xoá văn bản');
+
         /* -------- key sai -------- */
         const broken = keyText.slice(0, 10) + (keyText[10] === 'A' ? 'B' : 'A') + keyText.slice(11);
         await recvPage.cdp.eval(`(function(){const el=document.getElementById('keyIn');el.value=${JSON.stringify(broken)};el.dispatchEvent(new Event('input'));})()`);

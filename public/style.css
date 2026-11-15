@@ -187,6 +187,24 @@ button.ghost:hover {
     border-color: #94a3b8;
 }
 
+button.danger {
+    background: #fff;
+    border-color: #fecaca;
+    color: var(--err);
+    padding: 7px 12px;
+    font-size: 13px;
+}
+
+button.danger:hover {
+    background: #fef2f2;
+    border-color: #f87171;
+}
+
+button:disabled {
+    opacity: .5;
+    cursor: not-allowed;
+}
+
 /* ---------- thông báo ---------- */
 
 .msg {
@@ -274,6 +292,16 @@ button.ghost:hover {
     font-size: 14px;
     max-height: 340px;
     overflow: auto;
+}
+
+.edit-box {
+    margin-top: 12px;
+    padding-top: 12px;
+    border-top: 1px solid #bbf7d0;
+}
+
+.edit-box textarea {
+    min-height: 110px;
 }
 
 .footer {
