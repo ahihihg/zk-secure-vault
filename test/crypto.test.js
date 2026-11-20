@@ -180,3 +180,42 @@ test('dữ liệu rác không phải gói tin -> báo lỗi rõ ràng', async ()
         (e) => e.code === 'BAD_VERSION'
     );
 });
+
+/* ---------------- Gói tin v2: Văn bản + File đính kèm ---------------- */
+
+test('encryptPayload / decryptPayload roundtrip cho cả văn bản và tệp đính kèm', async () => {
+    const rootKey = zk.randomKey();
+    const fileData = new Uint8Array([0x25, 0x50, 0x44, 0x46, 0x2d, 0x31, 0x2e, 0x37, 0x0a, 0x99, 0xaa]);
+
+    const sealed = await zk.encryptPayload(
+        {
+            text: 'Đính kèm hợp đồng PDF',
+            file: { name: 'hop-dong-mat-2026.pdf', type: 'application/pdf', data: fileData }
+        },
+        rootKey
+    );
+
+    assert.equal(sealed.container[0], zk.VERSION_PAYLOAD);
+
+    // Không rò rỉ tên file hay nội dung trong bản mã
+    const rawStr = Buffer.from(sealed.container).toString('latin1');
+    assert.equal(rawStr.includes('hop-dong-mat-2026.pdf'), false);
+    assert.equal(rawStr.includes('application/pdf'), false);
+
+    const out = await zk.decryptPayload(sealed.container, rootKey);
+    assert.equal(out.text, 'Đính kèm hợp đồng PDF');
+    assert.ok(out.file);
+    assert.equal(out.file.name, 'hop-dong-mat-2026.pdf');
+    assert.equal(out.file.type, 'application/pdf');
+    assert.equal(out.file.size, fileData.length);
+    assert.deepEqual(out.file.data, fileData);
+});
+
+test('decryptPayload đọc tương thích ngược gói tin v1 (chỉ văn bản)', async () => {
+    const rootKey = zk.randomKey();
+    const v1 = await zk.encryptText('văn bản kiểu v1', rootKey);
+
+    const out = await zk.decryptPayload(v1.container, rootKey);
+    assert.equal(out.text, 'văn bản kiểu v1');
+    assert.equal(out.file, null);
+});

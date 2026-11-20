@@ -7,12 +7,14 @@
 │  TRÌNH DUYỆT           │        │  SERVER (Node.js)      │
 │                        │  HTTPS │                        │
 │  public/index.html     │◄──────►│  src/server.js         │
-│  public/app.js         │        │  ├─ POST /api/secret   │
-│  src/crypto.js  ───────┤        │  ├─ GET  /api/secret   │
-│  src/keycode.js        │        │  └─ file tĩnh          │
-│                        │        │                        │
-│  sinh key, mã hoá,     │        │  SQLite: data/vault.db │
-│  giải mã — TẤT CẢ ở đây│        │  (chỉ có bản mã)       │
+│  public/app.js         │        │  ├─ POST   /api/secret │
+│  src/crypto.js  ───────┤        │  ├─ GET    /api/secret │
+│  src/keycode.js        │        │  ├─ PUT    /api/secret │
+│                        │        │  ├─ DELETE /api/secret │
+│  sinh key, mã hoá,     │        │  └─ file tĩnh          │
+│  giải mã — TẤT CẢ ở đây│        │                        │
+│                        │        │  SQLite: data/vault.db │
+│                        │        │  (hoặc MinIO S3)       │
 └────────────────────────┘        └────────────────────────┘
 ```
 
@@ -62,6 +64,46 @@ Người nhận                                                 Server
    └─ hiện text
 ```
 
+## Luồng sửa (giữ nguyên key)
+
+```
+Người giữ key                                              Server
+──────────────────────────────────────────────────────────────────────
+1. đã mở văn bản bằng key ZKV1-… → bấm "Sửa nội dung"
+2. nhập nội dung mới → bấm "Lưu thay đổi"
+   ├─ dùng lại K và encKey cũ
+   ├─ sinh IV 12 byte ngẫu nhiên MỚI (không tái sử dụng nonce GCM)
+   ├─ bản mã mới = AES-256-GCM(encKey, text mới, IV mới)
+   └─ PUT /api/secret, header Authorization: Bearer authKey
+                              ────────────────────►
+                                                       3. tính lại id từ authKey
+                                                          kiểm tra bản ghi tồn tại & còn hạn
+                                                          ghi đè bản mã mới, làm mới hạn 7 ngày
+                              ◄────────────────────
+                                                       { ok: true, id, size, expiresAt }
+4. cập nhật hiển thị — key ZKV1-… giữ nguyên
+```
+
+Điểm quan trọng: cùng một `encKey` nhưng **bắt buộc sinh IV mới** cho mỗi lần `PUT`.
+Nếu dùng lại IV cũ với cùng `encKey` trong AES-GCM, hai bản mã sẽ làm lộ XOR của hai
+bản rõ và phá hỏng khoá xác thực GHASH.
+
+## Luồng xoá theo key
+
+```
+Người giữ key                                              Server
+──────────────────────────────────────────────────────────────────────
+1. đã mở văn bản bằng key ZKV1-… → bấm "Xoá văn bản"
+2. gửi DELETE /api/secret, header Authorization: Bearer authKey
+                              ────────────────────►
+                                                       3. tính lại id từ authKey
+                                                          kiểm tra tồn tại & còn hạn
+                                                          xoá khỏi SQLite (và MinIO S3 nếu bật)
+                              ◄────────────────────
+                                                       { ok: true, id }
+4. ẩn khung kết quả — key cũ không còn mở được nữa (trả 404)
+```
+
 ## Ai giữ gì
 
 | Giá trị | Ai tạo | Client có | Server có | Có trong database |
@@ -89,12 +131,14 @@ Có ba lý do thực tế:
 ## Vòng đời một văn bản
 
 ```
-tạo ──► tồn tại (tối đa 7 ngày) ──► hết hạn ──► bị xoá khỏi SQLite
+tạo (POST) ──► tồn tại (tối đa 7 ngày) ──► xoá theo key (DELETE) / hết hạn ──► bị xoá
+                    │            ▲
+                    └─ sửa (PUT) ┘ (làm mới hạn 7 ngày, giữ nguyên key)
 ```
 
-- Hạn tính từ lúc upload.
-- Có hàm dọn dẹp chạy mỗi 10 phút ([src/server.js:161](../src/server.js#L161)).
-- Hạn cũng được kiểm tra lúc đọc ([src/server.js:239](../src/server.js#L239)), nên không
+- Hạn tính từ lúc upload (và được làm mới 7 ngày sau mỗi lần sửa `PUT`).
+- Có hàm dọn dẹp chạy mỗi 10 phút ([src/server.js:165](../src/server.js#L165)).
+- Hạn cũng được kiểm tra lúc đọc, sửa và xoá ([src/server.js:272](../src/server.js#L272), [src/server.js:313](../src/server.js#L313), [src/server.js:372](../src/server.js#L372)), nên không
   phụ thuộc vào việc hàm dọn có chạy hay không.
 
 ## Những quyết định thiết kế và lý do

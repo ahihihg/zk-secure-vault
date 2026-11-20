@@ -19,7 +19,7 @@ Ba điều kiện tạo nên tính chất đó:
 | **A. Quản trị server tò mò** | toàn bộ database, log, file | đọc nội dung văn bản |
 | **B. Kẻ trộm database** | bản sao `vault.db` | như trên |
 | **C. Người dùng khác** | tài khoản không có, chỉ có HTTP | dò ra văn bản của người khác |
-| **D. Người có key** | key của một văn bản | đọc văn bản đó — **được phép** |
+| **D. Người có key** | key của một văn bản | đọc, sửa và xoá văn bản đó — **được phép** |
 
 ## Kết quả từng loại tấn công
 
@@ -34,7 +34,8 @@ Ba điều kiện tạo nên tính chất đó:
 | Sửa IV | Như trên | IV là đầu vào tính thẻ |
 | Cắt bớt / nối thêm dữ liệu | `AUTH_FAILED` | GCM xác thực toàn bộ |
 | Đổi byte version để "hạ cấp" định dạng | Bị chặn | version nằm trong AAD |
-| Ghi đè bản mã của người khác | Không làm được | Server tự tính `id` từ `authKey`, không tin `id` client gửi |
+| Ghi đè / sửa / xoá bản mã của người khác | Không làm được | Server tự tính `id` từ `authKey`, không tin `id` client gửi; `PUT`/`DELETE` trả `404` nếu sai key |
+| Tái sử dụng nonce khi sửa nhiều lần cùng key | Không xảy ra | Mỗi lần `PUT`, trình duyệt gọi `getRandomValues(12 byte)` sinh IV hoàn toàn mới |
 | Chèn script để lấy key | Bị chặn | CSP `script-src 'self'`, không có script ngoài, render bằng `textContent` |
 | Gửi dồn dập làm đầy ổ đĩa | Chặn một phần | rate limit 20 POST/phút + TTL 7 ngày + 64 KB/lần |
 | Dò key bằng thời gian phản hồi | Không áp dụng | Không có so sánh từng byte; sai key = không tìm thấy `id` |
@@ -46,7 +47,7 @@ Ba điều kiện tạo nên tính chất đó:
 | Rủi ro | Vì sao không chặn được | Giảm thiểu |
 |---|---|---|
 | **Mất key** | Không có bản sao nào của key ngoài chỗ người dùng giữ | Người dùng tự lưu: password manager, bản in |
-| **Ai có key là đọc được** | Bản chất mô hình capability, giống chìa khoá nhà | Cảnh báo trong UI; coi key như chìa khoá vật lý |
+| **Ai có key là đọc, sửa và xoá được** | Bản chất mô hình capability dùng 1 key duy nhất, chưa tách key read-only và key quản trị | Cảnh báo trong UI; coi key như chìa khoá vật lý |
 | **Máy người dùng bị nhiễm mã độc** | Malware đọc được RAM khi đang giải mã | Không có cách chặn ở tầng web |
 | **Server xoá hoặc từ chối phục vụ** | Zero-knowledge không bảo vệ tính sẵn sàng | Backup, hoặc chấp nhận rủi ro |
 | **Metadata** | Server buộc phải biết để vận hành: kích thước, thời điểm, IP, số lần đọc | Chấp nhận; hoặc thêm padding/onion routing |

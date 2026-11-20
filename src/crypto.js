@@ -37,6 +37,7 @@
     'use strict';
 
     const VERSION = 0x01;
+    const VERSION_PAYLOAD = 0x02; // gói tin v2: hỗ trợ cả văn bản + tệp đính kèm (mã hoá cả tên/kiểu tệp)
     const KEY_BYTES = 32;   // AES-256
     const IV_BYTES = 12;    // 96 bit — kích thước nonce khuyến nghị cho GCM
     const TAG_BYTES = 16;   // thẻ xác thực 128 bit
@@ -295,8 +296,155 @@
         return new TextDecoder().decode(plaintext);
     }
 
+    /* ------------------------------------------------------------------ */
+    /* Mã hoá / giải mã gói tin đa phương tiện (Văn bản + File đính kèm)   */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * Đóng gói cả văn bản và tệp đính kèm (cùng tên file, MIME type) vào một
+     * khối plaintext duy nhất rồi mã hoá bằng AES-256-GCM (VERSION_PAYLOAD = 0x02).
+     * Server và MinIO hoàn toàn không biết tên file hay định dạng file.
+     *
+     * Cấu trúc plaintext bên trong bản mã v2:
+     *   [4 byte uint32 BE: độ dài JSON metadata]
+     *   [JSON UTF-8: { text: string, file: { name, type, size } | null }]
+     *   [Bytes nhị phân của file (nếu có)]
+     *
+     * @param {{ text?: string, file?: { name: string, type?: string, data: Uint8Array|ArrayBuffer } | null }} payload
+     * @param {Uint8Array} rootKey 32 byte
+     */
+    async function encryptPayload(payload, rootKey) {
+        if (!payload || typeof payload !== 'object') {
+            throw new TypeError('encryptPayload() cần một object { text, file }.');
+        }
+
+        const text = typeof payload.text === 'string' ? payload.text : '';
+        let fileBytes = new Uint8Array(0);
+        let fileMeta = null;
+
+        if (payload.file != null) {
+            if (!payload.file.name || typeof payload.file.name !== 'string') {
+                throw new TypeError('file.name phải là chuỗi tên tệp hợp lệ.');
+            }
+            fileBytes = toBytes(payload.file.data, 'Nội dung tệp');
+            fileMeta = {
+                name: payload.file.name,
+                type: payload.file.type || 'application/octet-stream',
+                size: fileBytes.length
+            };
+        }
+
+        const c = subtle();
+        const derived = await deriveKeys(rootKey);
+        const iv = c.getRandomValues(new Uint8Array(IV_BYTES));
+
+        const metaBytes = new TextEncoder().encode(JSON.stringify({ text, file: fileMeta }));
+        const lenBuf = new Uint8Array(4);
+        new DataView(lenBuf.buffer).setUint32(0, metaBytes.length, false);
+
+        const plaintext = concatBytes([lenBuf, metaBytes, fileBytes]);
+
+        const sealed = new Uint8Array(await c.subtle.encrypt(
+            {
+                name: 'AES-GCM',
+                iv,
+                additionalData: Uint8Array.of(VERSION_PAYLOAD),
+                tagLength: TAG_BYTES * 8
+            },
+            derived.encKey,
+            plaintext
+        ));
+
+        const container = new Uint8Array(HEADER_BYTES + sealed.length);
+        container[0] = VERSION_PAYLOAD;
+        container.set(iv, 1);
+        container.set(sealed, HEADER_BYTES);
+
+        return { container, authKeyB64: derived.authKeyB64, id: derived.id };
+    }
+
+    /**
+     * Giải mã gói tin v1 (chỉ văn bản) hoặc v2 (văn bản + file đính kèm).
+     *
+     * @param {Uint8Array} container
+     * @param {Uint8Array} rootKey
+     * @returns {Promise<{ text: string, file: { name: string, type: string, size: number, data: Uint8Array } | null }>}
+     */
+    async function decryptPayload(container, rootKey) {
+        const raw = toBytes(container, 'Dữ liệu');
+        if (raw.length < MIN_CONTAINER_BYTES) {
+            throw new VaultError('Dữ liệu quá ngắn để là một gói tin ZK-Vault.', 'BAD_CONTAINER');
+        }
+
+        if (raw[0] === VERSION) {
+            const text = await decryptText(raw, rootKey);
+            return { text, file: null };
+        }
+
+        if (raw[0] !== VERSION_PAYLOAD) {
+            throw new VaultError(
+                'Phiên bản định dạng không hỗ trợ: 0x' + raw[0].toString(16).padStart(2, '0') + '.',
+                'BAD_VERSION'
+            );
+        }
+
+        const c = subtle();
+        const derived = await deriveKeys(rootKey);
+        const iv = raw.slice(1, HEADER_BYTES);
+        const sealed = raw.slice(HEADER_BYTES);
+
+        let decryptedBuf;
+        try {
+            decryptedBuf = await c.subtle.decrypt(
+                {
+                    name: 'AES-GCM',
+                    iv,
+                    additionalData: Uint8Array.of(VERSION_PAYLOAD),
+                    tagLength: TAG_BYTES * 8
+                },
+                derived.encKey,
+                sealed
+            );
+        } catch {
+            throw new VaultError('Sai key hoặc dữ liệu đã bị thay đổi (thẻ xác thực không khớp).', 'AUTH_FAILED');
+        }
+
+        const plain = new Uint8Array(decryptedBuf);
+        if (plain.length < 4) {
+            throw new VaultError('Cấu trúc dữ liệu giải mã không hợp lệ.', 'BAD_CONTAINER');
+        }
+
+        const metaLen = new DataView(plain.buffer, plain.byteOffset, plain.byteLength).getUint32(0, false);
+        if (4 + metaLen > plain.length) {
+            throw new VaultError('Header metadata của tệp bị hỏng.', 'BAD_CONTAINER');
+        }
+
+        let meta;
+        try {
+            meta = JSON.parse(new TextDecoder().decode(plain.slice(4, 4 + metaLen)));
+        } catch {
+            throw new VaultError('Metadata JSON sau giải mã không hợp lệ.', 'BAD_CONTAINER');
+        }
+
+        const fileBytes = plain.slice(4 + metaLen);
+        const file = meta.file
+            ? {
+                name: String(meta.file.name || 'file.bin'),
+                type: String(meta.file.type || 'application/octet-stream'),
+                size: fileBytes.length,
+                data: fileBytes
+            }
+            : null;
+
+        return {
+            text: typeof meta.text === 'string' ? meta.text : '',
+            file
+        };
+    }
+
     return {
         VERSION,
+        VERSION_PAYLOAD,
         KEY_BYTES,
         IV_BYTES,
         TAG_BYTES,
@@ -306,6 +454,8 @@
         deriveKeys,
         encryptText,
         decryptText,
+        encryptPayload,
+        decryptPayload,
         bytesToBase64Url,
         base64UrlToBytes
     };

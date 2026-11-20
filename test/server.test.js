@@ -10,7 +10,9 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
+const http = require('node:http');
 const { createServer } = require('../src/server.js');
+const { createS3Client } = require('../src/s3.js');
 const zk = require('../src/crypto.js');
 
 let counter = 0;
@@ -314,5 +316,122 @@ test('DELETE /api/secret xoá văn bản theo key', async () => {
         })).status, 404);
     } finally {
         await s.close();
+    }
+});
+
+test('MinIO S3 (AWS4-HMAC-SHA256): lưu, đọc, sửa và xoá tệp đính kèm mã hoá trên S3 bucket', async () => {
+    // Dựng S3/MinIO server giả lập kiểm tra chữ ký AWS4-HMAC-SHA256
+    const buckets = new Set();
+    const objects = new Map();
+
+    const mockMinio = http.createServer((req, res) => {
+        const authHeader = req.headers['authorization'] || '';
+        const contentSha = req.headers['x-amz-content-sha256'] || '';
+        const amzDate = req.headers['x-amz-date'] || '';
+
+        if (!authHeader.startsWith('AWS4-HMAC-SHA256 Credential=minioadmin/') || !contentSha || !amzDate) {
+            res.writeHead(403);
+            return res.end('Invalid SigV4');
+        }
+
+        const parts = req.url.split('/').filter(Boolean);
+        const bucket = parts[0];
+        const key = parts.slice(1).join('/');
+
+        if (!key) {
+            if (req.method === 'HEAD') {
+                res.writeHead(buckets.has(bucket) ? 200 : 404);
+                return res.end();
+            }
+            if (req.method === 'PUT') {
+                buckets.add(bucket);
+                res.writeHead(200);
+                return res.end();
+            }
+        }
+
+        const fullKey = `${bucket}/${key}`;
+        if (req.method === 'PUT') {
+            const chunks = [];
+            req.on('data', (c) => chunks.push(c));
+            req.on('end', () => {
+                objects.set(fullKey, Buffer.concat(chunks));
+                res.writeHead(200);
+                res.end();
+            });
+            return undefined;
+        }
+        if (req.method === 'GET') {
+            if (!objects.has(fullKey)) {
+                res.writeHead(404);
+                return res.end();
+            }
+            const buf = objects.get(fullKey);
+            res.writeHead(200, { 'Content-Length': buf.length });
+            return res.end(buf);
+        }
+        if (req.method === 'DELETE') {
+            objects.delete(fullKey);
+            res.writeHead(204);
+            return res.end();
+        }
+        res.writeHead(405);
+        return res.end();
+    });
+
+    await new Promise((r) => mockMinio.listen(0, '127.0.0.1', r));
+    const minioEndpoint = 'http://127.0.0.1:' + mockMinio.address().port;
+
+    const s3 = createS3Client({
+        endpoint: minioEndpoint,
+        bucket: 'zk-vault',
+        accessKey: 'minioadmin',
+        secretKey: 'minioadmin'
+    });
+    await s3.ensureBucket();
+    assert.equal(buckets.has('zk-vault'), true);
+
+    const s = await startServer({ s3 });
+    try {
+        const rootKey = zk.randomKey();
+        const fileContent = new Uint8Array([10, 20, 30, 40, 50, 60]);
+        const v1 = await zk.encryptPayload(
+            {
+                text: 'Tài liệu mật gửi lên MinIO',
+                file: { name: 'so-do-mang.png', type: 'image/png', data: fileContent }
+            },
+            rootKey
+        );
+
+        // 1. POST lên server -> lưu vào MinIO S3, SQLite chỉ giữ metadata (body rỗng)
+        const up = await fetch(s.base + '/api/secret', {
+            method: 'POST', headers: auth(v1.authKeyB64), body: v1.container
+        });
+        assert.equal(up.status, 201);
+        const upInfo = await up.json();
+        assert.equal(upInfo.storage, 'minio-s3');
+
+        // Kiểm tra: MinIO có object <id>.zkv, còn SQLite không chứa bytes bản mã
+        assert.equal(objects.has(`zk-vault/${v1.id}.zkv`), true);
+        const sqliteRow = s.vault.db.prepare('SELECT body FROM secrets WHERE id = ?').get(v1.id);
+        assert.equal(sqliteRow.body.byteLength, 0);
+
+        // 2. GET tải về và giải mã lại đúng cả text lẫn file
+        const down = await fetch(s.base + '/api/secret', { headers: auth(v1.authKeyB64) });
+        assert.equal(down.status, 200);
+        const decrypted = await zk.decryptPayload(new Uint8Array(await down.arrayBuffer()), rootKey);
+        assert.equal(decrypted.text, 'Tài liệu mật gửi lên MinIO');
+        assert.equal(decrypted.file.name, 'so-do-mang.png');
+        assert.deepEqual(decrypted.file.data, fileContent);
+
+        // 3. DELETE xoá cả trên MinIO lẫn SQLite
+        const del = await fetch(s.base + '/api/secret', {
+            method: 'DELETE', headers: auth(v1.authKeyB64)
+        });
+        assert.equal(del.status, 200);
+        assert.equal(objects.has(`zk-vault/${v1.id}.zkv`), false);
+    } finally {
+        await s.close();
+        await new Promise((r) => mockMinio.close(r));
     }
 });

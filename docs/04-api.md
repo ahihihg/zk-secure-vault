@@ -68,6 +68,61 @@ Trả lại đúng bytes đã lưu.
 chủ sở hữu" để mà phân biệt — nó chỉ băm ra một `id` rồi tra bảng. Không tìm thấy và không
 có quyền là **một vài trường hợp giống hệt nhau**, nên không rò rỉ thông tin.
 
+## PUT /api/secret
+
+Cập nhật bản mã mới cho một văn bản **đã tồn tại** theo đúng key cũ (giữ nguyên key `ZKV1-…`).
+Client tự mã hoá lại bằng cùng `rootKey` với **IV 12 byte ngẫu nhiên mới** trước khi gửi lên.
+
+**Header**
+
+| Header | Giá trị |
+|---|---|
+| `Authorization` | `Bearer <authKey>` |
+| `Content-Type` | `application/octet-stream` |
+
+**Response `200`**
+
+```json
+{
+  "ok": true,
+  "id": "110ceb4b4b5810c5fe78756e32c6f7a5",
+  "size": 62,
+  "expiresAt": 1763513621000,
+  "storage": "sqlite"
+}
+```
+
+**Hành vi & giới hạn**
+
+- Nếu `id` chưa tồn tại hoặc đã hết hạn → trả `404` (`NOT_FOUND` hoặc `EXPIRED`), **không** tự tạo mới như `POST`.
+- Cập nhật thành công sẽ làm mới `expiresAt` thêm 7 ngày kể từ thời điểm sửa.
+- Dùng chung hạn mức ghi (`20` lượt `POST`/`PUT`/`DELETE` / phút / IP) và giới hạn kích thước `maxBytes`.
+
+## DELETE /api/secret
+
+Xoá ngay văn bản gắn với key khỏi server (xoá cả bản ghi SQLite và object `<id>.zkv` trên MinIO S3 nếu đang bật).
+
+**Header**
+
+| Header | Giá trị |
+|---|---|
+| `Authorization` | `Bearer <authKey>` |
+
+**Response `200`**
+
+```json
+{
+  "ok": true,
+  "id": "110ceb4b4b5810c5fe78756e32c6f7a5"
+}
+```
+
+**Hành vi & giới hạn**
+
+- Nếu `id` chưa tồn tại hoặc đã hết hạn → trả `404` (`NOT_FOUND` hoặc `EXPIRED`).
+- Sau khi xoá, mọi yêu cầu `GET` / `PUT` / `DELETE` tiếp theo với cùng key đều trả `404`.
+- Dùng chung hạn mức ghi (`20` lượt / phút / IP).
+
 ## GET /api/health
 
 ```json
@@ -126,6 +181,32 @@ const res = await fetch('http://127.0.0.1:8787/api/secret', {
     headers: { 'Authorization': 'Bearer lN7bd6Uxz7lU9DE3BNoZn0P4aD2SvfrfdDM73ZEU5tg' }
 });
 const bytes = new Uint8Array(await res.arrayBuffer());
+```
+
+Sửa nội dung (gửi gói tin mới đã mã hoá lại cùng key, với IV mới):
+
+```js
+const res = await fetch('http://127.0.0.1:8787/api/secret', {
+    method: 'PUT',
+    headers: {
+        'Authorization': 'Bearer lN7bd6Uxz7lU9DE3BNoZn0P4aD2SvfrfdDM73ZEU5tg',
+        'Content-Type': 'application/octet-stream'
+    },
+    body: newContainer
+});
+console.log(res.status, await res.json());
+// 200 { ok: true, id: '110ceb4b4b5810c5fe78756e32c6f7a5', size: …, expiresAt: …, storage: 'sqlite' }
+```
+
+Xoá văn bản theo key:
+
+```js
+const res = await fetch('http://127.0.0.1:8787/api/secret', {
+    method: 'DELETE',
+    headers: { 'Authorization': 'Bearer lN7bd6Uxz7lU9DE3BNoZn0P4aD2SvfrfdDM73ZEU5tg' }
+});
+console.log(res.status, await res.json());
+// 200 { ok: true, id: '110ceb4b4b5810c5fe78756e32c6f7a5' }
 ```
 
 Kiểm tra server sống bằng curl:

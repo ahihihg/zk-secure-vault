@@ -5,7 +5,7 @@ không có khả năng đọc nội dung.
 
 ```
 soạn text  ──►  mã hoá tại trình duyệt  ──►  server lưu bản mã  ──►  trả về key ZKV1-…
-dán key    ──►  tìm bản mã theo key     ──►  giải mã tại trình duyệt  ──►  hiện lại text
+dán key    ──►  tìm bản mã theo key     ──►  giải mã tại trình duyệt  ──►  hiện / sửa / xoá text
 ```
 
 ## Chạy thử
@@ -45,10 +45,10 @@ public/
 ├── app.js        # luồng client
 └── style.css
 test/
-├── keycode.test.js  # 10 test
-├── crypto.test.js   # 19 test
-├── server.test.js   # 13 test
-└── e2e.cjs          # 12 kiểm tra trên Chrome thật
+├── keycode.test.js  # 11 test
+├── crypto.test.js   # 21 test
+├── server.test.js   # 16 test
+└── e2e.cjs          # 16 kiểm tra trên Chrome thật
 docs/               # tài liệu đọc hiểu dự án
 ```
 
@@ -74,6 +74,6 @@ node test/e2e.cjs        # cần Chrome hoặc Edge
 
 - **Mất key là mất văn bản.** Không có khôi phục, không có hỗ trợ — đây là hệ quả trực tiếp
   của việc không cần tài khoản.
-- **Ai có key là đọc được.** Key là chìa khoá vật lý, không phải mật khẩu.
+- **Ai có key là đọc, sửa và xoá được.** Key là chìa khoá vật lý, không phải mật khẩu.
 - **Giới hạn 200 từ** đang chặn ở client. Muốn chắc chắn thì phải chặn cả ở server.
 - Văn bản tự xoá sau **7 ngày**; server vẫn thấy kích thước, thời điểm gửi và IP.

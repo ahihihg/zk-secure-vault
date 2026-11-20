@@ -1,0 +1,19 @@
+services:
+  minio:
+    image: minio/minio:latest
+    container_name: zk-vault-minio
+    ports:
+      - "9000:9000"   # Cổng S3 API (Node.js server gọi vào đây)
+      - "9001:9001"   # Cổng Web Console (mở http://127.0.0.1:9001 để quản lý)
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    command: server /data --console-address ":9001"
+    volumes:
+      - ./data/minio:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 3

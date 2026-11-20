@@ -125,25 +125,25 @@ như các định dạng thân thiện với người đọc khác.
 
 ## src/server.js
 
-### `idFromAuthKey(token)` — [src/server.js:114](../src/server.js#L114)
+### `idFromAuthKey(token)` — [src/server.js:118](../src/server.js#L118)
 
 ```js
 crypto.createHash('sha256').update('zkv1/id').update(auth).digest().subarray(0, 16)
 ```
 
-Phải khớp **chính xác** với client ([src/crypto.js:208](../src/crypto.js#L208)): cùng chuỗi
+Phải khớp **chính xác** với client ([src/crypto.js:209](../src/crypto.js#L209)): cùng chuỗi
 miền `"zkv1/id"`, cùng thứ tự nối. Lệch một byte là server tính ra `id` khác và không bao
 giờ tìm thấy dữ liệu.
 
-### `handlePost` — [src/server.js:202](../src/server.js#L202)
+### `handlePost` — [src/server.js:209](../src/server.js#L209)
 
 ```
-rate limit → kiểm Authorization → đọc body (≤ 64 KB) → kiểm độ dài → ghi DB
+rate limit → kiểm Authorization → đọc body (≤ maxBytes) → kiểm độ dài → ghi DB (hoặc MinIO S3)
 ```
 
 Điểm cần nhớ: **không có tham số `id` từ client**. Server tự suy ra.
 
-### `handleGet` — [src/server.js:239](../src/server.js#L239)
+### `handleGet` — [src/server.js:258](../src/server.js#L258)
 
 ```
 rate limit → Authorization → id → tìm trong DB → kiểm hạn → trả bytes
@@ -152,27 +152,44 @@ rate limit → Authorization → id → tìm trong DB → kiểm hạn → trả
 Ba nhánh trả về, và chúng cố tình giống nhau ở tầng HTTP (đều `404`), chỉ khác `message`:
 không tìm thấy, hết hạn, hoặc không tồn tại.
 
-### `readBody` — [src/server.js:172](../src/server.js#L172)
+### `handlePut` — [src/server.js:299](../src/server.js#L299)
+
+```
+rate limit → Authorization → id → kiểm bản ghi tồn tại & còn hạn → đọc body → kiểm độ dài → ghi đè + gia hạn TTL
+```
+
+Khác với `POST`: `PUT` đòi hỏi bản ghi đã tồn tại và chưa hết hạn, nếu không trả `404`.
+Server vẫn không biết nội dung mới là gì — chỉ thay cục byte bản mã theo cùng `id`.
+
+### `handleDelete` — [src/server.js:358](../src/server.js#L358)
+
+```
+rate limit → Authorization → id → kiểm tồn tại & còn hạn → xoá khỏi S3 (nếu có) & SQLite → trả 200
+```
+
+Xoá xong trả `{ ok: true, id }`. Nếu gọi lại lần nữa với cùng key sẽ trả `404`.
+
+### `readBody` — [src/server.js:179](../src/server.js#L179)
 
 Đọc body theo từng chunk, cộng dồn kích thước và cắt ngay khi vượt hạn mức. Chú ý: khi vượt
 giới hạn, hàm **không huỷ socket ngay** mà để router còn kịp trả `413` cho client — huỷ sớm
 thì client chỉ thấy "connection reset" thay vì một thông báo tử tế.
 
-### Router — [src/server.js:311](../src/server.js#L311)
+### Router — [src/server.js:424](../src/server.js#L424)
 
-Rất ngắn: ba đường API, còn lại là file tĩnh. File tĩnh được chặn thoát thư mục bằng
-`file.startsWith(path.resolve(publicDir))` ([src/server.js:278](../src/server.js#L278)).
+Rất ngắn: hai đường API (`/api/health`, `/api/secret` với `GET`/`POST`/`PUT`/`DELETE`), còn lại là file tĩnh. File tĩnh được chặn thoát thư mục bằng
+`file.startsWith(path.resolve(publicDir))` ([src/server.js:397](../src/server.js#L397)).
 
 ---
 
 ## public/app.js
 
-### `refreshCounter()` — [public/app.js:49](../public/app.js#L49)
+### `refreshCounter()` — [public/app.js:56](../public/app.js#L56)
 
 Đếm từ bằng `text.trim().split(/\s+/).length` và khoá nút gửi khi vượt 200.
 Đây là **giới hạn phía client**; server không kiểm tra số từ (xem "Giới hạn" ở README).
 
-### `sendText()` — [public/app.js:64](../public/app.js#L64)
+### `sendText()` — [public/app.js:103](../public/app.js#L103)
 
 ```js
 const rootKey = ZKCrypto.randomKey();
@@ -183,17 +200,40 @@ $('keyOut').textContent = ZKKeycode.encode(rootKey);
 
 Toàn bộ luồng gửi nằm trong 4 dòng này. `rootKey` chỉ sống trong biến cục bộ.
 
-### `openText(rawKey)` — [public/app.js:148](../public/app.js#L148)
+### `openText(rawKey)` — [public/app.js:310](../public/app.js#L310)
 
 ```js
-const rootKey = ZKKeycode.decode(rawKey);          // 1. key -> 32 byte
-const derived = await ZKCrypto.deriveKeys(rootKey); // 2. -> authKey, id
+const rootKey = ZKKeycode.decode(rawKey);              // 1. key -> 32 byte
+const derived = await ZKCrypto.deriveKeys(rootKey);    // 2. -> authKey, id
 // 3. GET /api/secret
 const container = new Uint8Array(await res.arrayBuffer());
-const text = await ZKCrypto.decryptText(container, rootKey); // 4. giải mã
+const payload = await ZKCrypto.decryptPayload(container, rootKey); // 4. giải mã
 ```
 
-### Xử lý ô nhập key — [public/app.js:187](../public/app.js#L187)
+Khi giải mã thành công, `activeRootKey` và `activeAuthKeyB64` được giữ trong RAM của trang
+để phục vụ ngay cho thao tác **Sửa** và **Xoá** (và bị xoá sạch khi đổi key hoặc xoá xong).
+
+### `saveEditedText()` — [public/app.js:374](../public/app.js#L374)
+
+Khi người dùng bấm **Sửa nội dung** → **Lưu thay đổi**:
+
+```js
+const sealed = pendingEditFile
+    ? await ZKCrypto.encryptPayload({ text, file: pendingEditFile }, activeRootKey)
+    : await ZKCrypto.encryptText(text, activeRootKey);
+await fetch('/api/secret', { method: 'PUT', headers: { Authorization: 'Bearer ' + sealed.authKeyB64 }, body: sealed.container });
+```
+
+Hàm mã hoá lại dùng đúng `activeRootKey` nhưng luôn sinh **IV 12 byte ngẫu nhiên mới**,
+nhờ đó key cũ vẫn giữ nguyên mà không vi phạm yêu cầu duy nhất của nonce AES-GCM.
+
+### Xử lý nút Xoá (`#delBtn`) — [public/app.js:429](../public/app.js#L429)
+
+Gửi `DELETE /api/secret` kèm `Authorization: Bearer <activeAuthKeyB64>`. Khi thành công,
+ẩn khung kết quả, xoá `activeRootKey`/`activeAuthKeyB64` khỏi bộ nhớ và thông báo key
+không còn mở được nữa.
+
+### Xử lý ô nhập key — [public/app.js:464](../public/app.js#L464)
 
 Không có nút "Mở": mỗi lần người dùng gõ/dán, ta kiểm tra định dạng; nếu hợp lệ thì hẹn
 250 ms rồi tự động gọi `openText`. Nhờ vậy dán key là thấy kết quả ngay.

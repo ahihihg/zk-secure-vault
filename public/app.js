@@ -3,20 +3,19 @@
  * không localStorage, không cookie, không gửi key lên server.
  *
  * Luồng gửi:
- *   text --(AES-GCM tại máy)--> bản mã --POST--> server
- *                                          └──> hiện key ZKV1-… cho người dùng
+ *   text + file --(AES-GCM tại máy)--> bản mã --POST--> server (MinIO S3)
+ *                                                 └──> hiện key ZKV1-… cho người dùng
  *
- * Luồng nhận:
- *   key --(HKDF)--> authKey --GET--> bản mã --(AES-GCM tại máy)--> text
+ * Luồng nhận / sửa / xoá:
+ *   key --(HKDF)--> authKey --GET/PUT/DELETE--> bản mã --(AES-GCM tại máy)--> text + file
  */
 (function () {
     'use strict';
 
     const MAX_WORDS = 200;
+    const MAX_FILE_BYTES = 20 * 1024 * 1024; // 20 MB
 
     const $ = (id) => document.getElementById(id);
-    const encoder = new TextEncoder();
-    const decoder = new TextDecoder();
 
     /* ------------------------------------------------------------------ */
     /* Tiện ích                                                            */
@@ -25,6 +24,12 @@
     function countWords(text) {
         const t = text.trim();
         return t === '' ? 0 : t.split(/\s+/).length;
+    }
+
+    function formatBytes(bytes) {
+        if (bytes < 1024) return bytes + ' byte';
+        if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+        return (bytes / (1024 * 1024)).toFixed(2) + ' MB';
     }
 
     function setMsg(which, kind, html) {
@@ -43,8 +48,10 @@
         ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
     /* ------------------------------------------------------------------ */
-    /* Bộ đếm từ                                                           */
+    /* Chọn tệp & Bộ đếm từ (Cột Gửi)                                      */
     /* ------------------------------------------------------------------ */
+
+    let selectedSendFile = null;
 
     function refreshCounter() {
         const words = countWords($('plain').value);
@@ -52,10 +59,42 @@
 
         counter.textContent = words + '/' + MAX_WORDS + ' từ';
         counter.classList.toggle('over', words > MAX_WORDS);
-        $('send').disabled = words === 0 || words > MAX_WORDS;
+
+        const hasValidContent = words > 0 || selectedSendFile != null;
+        $('send').disabled = !hasValidContent || words > MAX_WORDS;
     }
 
     $('plain').addEventListener('input', refreshCounter);
+
+    $('fileIn').addEventListener('change', () => {
+        const f = $('fileIn').files && $('fileIn').files[0];
+        if (!f) return;
+
+        if (f.size > MAX_FILE_BYTES) {
+            $('fileIn').value = '';
+            selectedSendFile = null;
+            $('fileMeta').hidden = true;
+            $('clearFileBtn').hidden = true;
+            setMsg('send', 'err', 'Tệp vượt quá giới hạn 20 MB (' + formatBytes(f.size) + ').');
+            refreshCounter();
+            return;
+        }
+
+        selectedSendFile = f;
+        $('fileMeta').textContent = f.name + ' (' + formatBytes(f.size) + ')';
+        $('fileMeta').hidden = false;
+        $('clearFileBtn').hidden = false;
+        setMsg('send', null);
+        refreshCounter();
+    });
+
+    $('clearFileBtn').addEventListener('click', () => {
+        $('fileIn').value = '';
+        selectedSendFile = null;
+        $('fileMeta').hidden = true;
+        $('clearFileBtn').hidden = true;
+        refreshCounter();
+    });
 
     /* ------------------------------------------------------------------ */
     /* Gửi                                                                 */
@@ -65,8 +104,12 @@
         const text = $('plain').value.trim();
         const words = countWords(text);
 
-        if (!text) return setMsg('send', 'err', 'Hãy nhập văn bản trước.');
-        if (words > MAX_WORDS) return setMsg('send', 'err', 'Vượt quá ' + MAX_WORDS + ' từ.');
+        if (!text && !selectedSendFile) {
+            return setMsg('send', 'err', 'Hãy nhập văn bản hoặc chọn tệp đính kèm.');
+        }
+        if (words > MAX_WORDS) {
+            return setMsg('send', 'err', 'Vượt quá ' + MAX_WORDS + ' từ.');
+        }
 
         $('send').disabled = true;
         $('keyBox').hidden = true;
@@ -74,10 +117,27 @@
 
         try {
             const rootKey = ZKCrypto.randomKey();
-            const sealed = await ZKCrypto.encryptText(text, rootKey);
+            let sealed;
+
+            if (selectedSendFile) {
+                const fileBuf = new Uint8Array(await selectedSendFile.arrayBuffer());
+                sealed = await ZKCrypto.encryptPayload(
+                    {
+                        text,
+                        file: {
+                            name: selectedSendFile.name,
+                            type: selectedSendFile.type || 'application/octet-stream',
+                            data: fileBuf
+                        }
+                    },
+                    rootKey
+                );
+            } else {
+                sealed = await ZKCrypto.encryptText(text, rootKey);
+            }
 
             setMsg('send', 'info', '<span class="spinner"></span>Đang lưu ' +
-                sealed.container.length + ' byte bản mã lên server…');
+                formatBytes(sealed.container.length) + ' bản mã lên server…');
 
             const res = await fetch('/api/secret', {
                 method: 'POST',
@@ -94,15 +154,16 @@
             }
 
             const info = await res.json();
+            const storageLabel = info.storage === 'minio-s3' ? ' (MinIO S3)' : '';
 
             $('keyOut').textContent = ZKKeycode.encode(rootKey);
             $('keyBox').hidden = false;
-            setMsg('send', 'ok', 'Đã lưu ' + info.size + ' byte bản mã. Copy key và gửi cho người nhận — ' +
-                'server không có key này nên không có cách nào khôi phục hộ.');
+            setMsg('send', 'ok', 'Đã lưu ' + info.size + ' byte bản mã' + storageLabel +
+                '. Copy key và gửi cho người nhận — server không có key này nên không có cách nào khôi phục hộ.');
         } catch (err) {
             setMsg('send', 'err', esc(err.message));
         } finally {
-            $('send').disabled = false;
+            refreshCounter();
         }
     }
 
@@ -139,7 +200,7 @@
     });
 
     /* ------------------------------------------------------------------ */
-    /* Nhận — tự động mở khi key hợp lệ, sửa & xoá theo key                */
+    /* Nhận — tự động mở khi key hợp lệ, tải file, sửa & xoá theo key      */
     /* ------------------------------------------------------------------ */
 
     let debounce = null;
@@ -147,11 +208,51 @@
     let lastKey = '';
     let activeRootKey = null;
     let activeAuthKeyB64 = '';
+    let activeFile = null;       // { name, type, size, data: Uint8Array } | null
+    let pendingEditFile = null;  // file đang giữ trong chế độ Sửa
+
+    function renderDecryptedResult(text, file) {
+        activeFile = file || null;
+
+        if (text) {
+            $('textOut').textContent = text;
+            $('textOut').hidden = false;
+            $('textLabel').hidden = false;
+        } else if (file) {
+            $('textOut').textContent = '';
+            $('textOut').hidden = true;
+            $('textLabel').hidden = true;
+        } else {
+            $('textOut').textContent = '';
+            $('textOut').hidden = false;
+            $('textLabel').hidden = false;
+        }
+
+        if (file) {
+            $('fileNameOut').textContent = file.name;
+            $('fileSizeOut').textContent = formatBytes(file.size) + (file.type ? ' · ' + file.type : '');
+            $('fileResult').hidden = false;
+        } else {
+            $('fileResult').hidden = true;
+        }
+    }
+
+    $('downloadFileBtn').addEventListener('click', () => {
+        if (!activeFile) return;
+        const blob = new Blob([activeFile.data], { type: activeFile.type || 'application/octet-stream' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = activeFile.name || 'secret.bin';
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 3000);
+    });
 
     function closeEditMode() {
         $('editBox').hidden = true;
         $('resultActions').hidden = false;
-        $('textOut').hidden = false;
     }
 
     function refreshEditCounter() {
@@ -160,10 +261,51 @@
 
         counter.textContent = words + '/' + MAX_WORDS + ' từ';
         counter.classList.toggle('over', words > MAX_WORDS);
-        $('saveEditBtn').disabled = words === 0 || words > MAX_WORDS;
+
+        const hasValidContent = words > 0 || pendingEditFile != null;
+        $('saveEditBtn').disabled = !hasValidContent || words > MAX_WORDS;
     }
 
     $('editPlain').addEventListener('input', refreshEditCounter);
+
+    function syncEditFileUI() {
+        if (pendingEditFile) {
+            $('editFileMeta').textContent = pendingEditFile.name + ' (' + formatBytes(pendingEditFile.size) + ')';
+            $('editFileMeta').hidden = false;
+            $('removeEditFileBtn').hidden = false;
+        } else {
+            $('editFileMeta').hidden = true;
+            $('removeEditFileBtn').hidden = true;
+        }
+        refreshEditCounter();
+    }
+
+    $('editFileIn').addEventListener('change', async () => {
+        const f = $('editFileIn').files && $('editFileIn').files[0];
+        if (!f) return;
+
+        if (f.size > MAX_FILE_BYTES) {
+            $('editFileIn').value = '';
+            setMsg('recv', 'err', 'Tệp vượt quá giới hạn 20 MB (' + formatBytes(f.size) + ').');
+            return;
+        }
+
+        const buf = new Uint8Array(await f.arrayBuffer());
+        pendingEditFile = {
+            name: f.name,
+            type: f.type || 'application/octet-stream',
+            size: buf.length,
+            data: buf
+        };
+        setMsg('recv', null);
+        syncEditFileUI();
+    });
+
+    $('removeEditFileBtn').addEventListener('click', () => {
+        $('editFileIn').value = '';
+        pendingEditFile = null;
+        syncEditFileUI();
+    });
 
     async function openText(rawKey) {
         if (busy) return;
@@ -173,7 +315,8 @@
         $('result').hidden = true;
         activeRootKey = null;
         activeAuthKeyB64 = '';
-        setMsg('recv', 'info', '<span class="spinner"></span>Đang tìm văn bản trên server…');
+        activeFile = null;
+        setMsg('recv', 'info', '<span class="spinner"></span>Đang tìm văn bản / tệp trên server…');
 
         try {
             // Bước 1: key -> authKey (và id) bằng HKDF
@@ -192,13 +335,13 @@
 
             const container = new Uint8Array(await res.arrayBuffer());
 
-            // Bước 3: giải mã tại máy
+            // Bước 3: giải mã tại máy (hỗ trợ cả gói v1 chỉ text và gói v2 có file đính kèm)
             setMsg('recv', 'info', '<span class="spinner"></span>Đang giải mã trên máy bạn…');
-            const text = await ZKCrypto.decryptText(container, rootKey);
+            const payload = await ZKCrypto.decryptPayload(container, rootKey);
 
             activeRootKey = rootKey;
             activeAuthKeyB64 = derived.authKeyB64;
-            $('textOut').textContent = text;
+            renderDecryptedResult(payload.text, payload.file);
             $('result').hidden = false;
             setMsg('recv', null);
         } catch (err) {
@@ -212,7 +355,11 @@
     $('editBtn').addEventListener('click', () => {
         if (!activeRootKey) return;
         $('editPlain').value = $('textOut').textContent;
-        refreshEditCounter();
+        $('editFileIn').value = '';
+        pendingEditFile = activeFile
+            ? { name: activeFile.name, type: activeFile.type, size: activeFile.size, data: activeFile.data }
+            : null;
+        syncEditFileUI();
         $('resultActions').hidden = true;
         $('editBox').hidden = false;
         setMsg('recv', null);
@@ -230,8 +377,12 @@
         const text = $('editPlain').value.trim();
         const words = countWords(text);
 
-        if (!text) return setMsg('recv', 'err', 'Hãy nhập văn bản trước.');
-        if (words > MAX_WORDS) return setMsg('recv', 'err', 'Vượt quá ' + MAX_WORDS + ' từ.');
+        if (!text && !pendingEditFile) {
+            return setMsg('recv', 'err', 'Hãy nhập văn bản hoặc đính kèm tệp.');
+        }
+        if (words > MAX_WORDS) {
+            return setMsg('recv', 'err', 'Vượt quá ' + MAX_WORDS + ' từ.');
+        }
 
         busy = true;
         $('saveEditBtn').disabled = true;
@@ -239,8 +390,10 @@
         setMsg('recv', 'info', '<span class="spinner"></span>Đang mã hoá lại và cập nhật lên server…');
 
         try {
-            // Mã hoá văn bản mới với cùng rootKey nhưng IV 12 byte ngẫu nhiên mới hoàn toàn
-            const sealed = await ZKCrypto.encryptText(text, activeRootKey);
+            // Mã hoá lại với cùng rootKey nhưng IV 12 byte ngẫu nhiên mới hoàn toàn
+            const sealed = pendingEditFile
+                ? await ZKCrypto.encryptPayload({ text, file: pendingEditFile }, activeRootKey)
+                : await ZKCrypto.encryptText(text, activeRootKey);
 
             const res = await fetch('/api/secret', {
                 method: 'PUT',
@@ -256,7 +409,7 @@
                 throw new Error(info.message || ('Cập nhật thất bại (HTTP ' + res.status + ').'));
             }
 
-            $('textOut').textContent = text;
+            renderDecryptedResult(text, pendingEditFile);
             closeEditMode();
             setMsg('recv', 'ok', 'Đã cập nhật nội dung văn bản (key giữ nguyên).');
         } catch (err) {
@@ -296,6 +449,7 @@
             $('result').hidden = true;
             activeRootKey = null;
             activeAuthKeyB64 = '';
+            activeFile = null;
             lastKey = '';
             setMsg('recv', 'ok', 'Đã xoá văn bản khỏi server. Key này không còn mở được nữa.');
         } catch (err) {
@@ -317,6 +471,7 @@
             $('result').hidden = true;
             activeRootKey = null;
             activeAuthKeyB64 = '';
+            activeFile = null;
             lastKey = '';
 
             if (value.trim() === '') {

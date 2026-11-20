@@ -7,8 +7,8 @@ node --test test/keycode.test.js test/crypto.test.js test/server.test.js
 ```
 
 ```
-ℹ tests 42
-ℹ pass 42
+ℹ tests 48
+ℹ pass 48
 ℹ fail 0
 ```
 
@@ -19,7 +19,7 @@ node test/e2e.cjs       # cần Chrome hoặc Edge
 ```
 
 `e2e.cjs` tự bật một server tạm trên cổng ngẫu nhiên, mở Chrome headless, thao tác như
-người dùng (gõ text, bấm nút, dán key ở tab khác) rồi chụp ảnh vào `docs/`.
+người dùng (gõ text, bấm gửi, dán key ở tab khác, sửa nội dung theo key, xoá văn bản theo key) rồi chụp ảnh vào `docs/`.
 
 ## Ba nhóm test
 
@@ -56,7 +56,7 @@ Kiểm tra cách key được sinh và đọc lại.
 | | đổi version | `BAD_VERSION` |
 | | cắt bớt / dữ liệu rác | lỗi rõ ràng, không trả rác |
 
-### `test/server.test.js` — 13 test
+### `test/server.test.js` — 16 test
 
 | Test | Bảo vệ điều gì |
 |---|---|
@@ -67,12 +67,15 @@ Kiểm tra cách key được sinh và đọc lại.
 | key khác → 404 | không có oracle để dò |
 | thiếu Authorization → 401 | không ai gọi được khi chưa chứng minh |
 | hết hạn TTL | dữ liệu bị xoá thật khỏi DB |
-| quá 64 KB → 413 | chống làm đầy ổ đĩa |
+| quá giới hạn → 413 | chống làm đầy ổ đĩa |
 | gói tin quá ngắn → 400 | dữ liệu rác bị chặn sớm |
 | rate limit | 3 lượt đầu 201, sau đó 429 |
 | thoát thư mục | path traversal bị chặn |
 | CSP | header bảo mật còn nguyên |
 | thư viện dùng chung | `/crypto.js`, `/keycode.js` phục vụ đúng |
+| `PUT /api/secret` sửa theo key | cập nhật bản mã với IV mới, giữ nguyên key; key không tồn tại → 404 |
+| `DELETE /api/secret` xoá theo key | xoá khỏi server; đọc hoặc xoá lại lần 2 đều trả 404 |
+| MinIO S3 (SigV4) | lưu, đọc và xoá gói tin mã hoá trên S3 bucket |
 
 Mỗi test đều chạy trên **thư mục dữ liệu tạm** và **cổng ngẫu nhiên**, nên chạy song song
 hay chạy lại nhiều lần đều không ảnh hưởng `data/` thật.
@@ -134,6 +137,12 @@ Mở DevTools → Network → gửi một đoạn text. Request `POST /api/secre
 - Body là byte nhị phân
 
 Không có trường nào chứa văn bản gốc.
+
+### 5. Sửa và xoá văn bản theo key
+
+1. Mở văn bản bằng key ở mục **2. Nhận văn bản** → bấm **Sửa nội dung** → đổi text → bấm **Lưu thay đổi**.
+2. Kiểm tra tab Network: request `PUT /api/secret` gửi bản mã mới (IV mới) kèm `Authorization: Bearer …`, trả về `200`. Dán lại đúng key cũ ở tab khác sẽ thấy nội dung đã cập nhật.
+3. Bấm **Xoá văn bản**: request `DELETE /api/secret` trả về `200`, khung kết quả biến mất. Dán lại key đó sẽ báo không tìm thấy (`404`).
 
 ## Điều các test này **chưa** kiểm tra
 
