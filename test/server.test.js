@@ -11,19 +11,41 @@ const os = require('node:os');
 const path = require('node:path');
 
 const http = require('node:http');
+const { DatabaseSync } = require('node:sqlite');
 const { createServer } = require('../src/server.js');
 const { createS3Client } = require('../src/s3.js');
 const zk = require('../src/crypto.js');
 
 let counter = 0;
 
+/** S3 lưu tạm trên RAM để test nhanh mà không cần bật Docker MinIO. */
+function createMemoryS3() {
+    const objects = new Map();
+    return {
+        objects,
+        async putObject(key, data) {
+            objects.set(key, Buffer.from(data));
+            return true;
+        },
+        async getObject(key) {
+            return objects.has(key) ? Buffer.from(objects.get(key)) : null;
+        },
+        async deleteObject(key) {
+            objects.delete(key);
+            return true;
+        }
+    };
+}
+
 async function startServer(options = {}) {
     const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zkv-test-' + (counter++) + '-'));
-    const vault = createServer({ dataDir, ...options });
+    const s3 = options.s3 || createMemoryS3();
+    const vault = createServer({ dataDir, ...options, s3 });
     await new Promise((r) => vault.server.listen(0, '127.0.0.1', r));
 
     return {
         vault,
+        s3,
         base: 'http://127.0.0.1:' + vault.server.address().port,
         async close() {
             await new Promise((r) => vault.server.close(r));
@@ -100,7 +122,7 @@ test('đi trọn vòng: gửi bằng máy A, đọc lại bằng key ở máy B'
     }
 });
 
-test('server không lưu được nội dung đọc được', async () => {
+test('server không lưu được nội dung đọc được (SQLite chỉ có metadata, S3 chỉ có bản mã)', async () => {
     const s = await startServer();
     try {
         const sealed = await seal('nội dung tuyệt mật hop-dong');
@@ -108,15 +130,18 @@ test('server không lưu được nội dung đọc được', async () => {
             method: 'POST', headers: auth(sealed.authKeyB64), body: sealed.container
         });
 
-        const rows = s.vault.db.prepare('SELECT id, body FROM secrets').all();
+        // SQLite chỉ chứa metadata (id, created_at, expires_at), không có cột body hay key
+        const rows = s.vault.db.prepare('SELECT * FROM secrets').all();
         assert.equal(rows.length, 1);
+        assert.deepEqual(Object.keys(rows[0]), ['id', 'created_at', 'expires_at']);
+        assert.equal(rows[0].id, sealed.id);
 
-        const stored = Buffer.from(rows[0].body).toString('latin1');
+        // S3 chỉ lưu bản mã nhị phân, không chứa plaintext
+        const obj = s.s3.objects.get(sealed.id + '.zkv');
+        assert.ok(obj);
+        const stored = obj.toString('latin1');
         assert.equal(stored.includes('hop-dong'), false);
         assert.equal(stored.includes('tuyệt mật'), false);
-
-        // và bảng không có cột nào chứa key
-        assert.deepEqual(Object.keys(rows[0]), ['id', 'body']);
     } finally {
         await s.close();
     }
@@ -166,6 +191,7 @@ test('hết hạn TTL thì văn bản bị xoá', async () => {
 
         const rows = s.vault.db.prepare('SELECT COUNT(*) AS n FROM secrets').get();
         assert.equal(rows.n, 0);
+        assert.equal(s.s3.objects.has(sealed.id + '.zkv'), false);
     } finally {
         await s.close();
     }
@@ -411,10 +437,11 @@ test('MinIO S3 (AWS4-HMAC-SHA256): lưu, đọc, sửa và xoá tệp đính kè
         const upInfo = await up.json();
         assert.equal(upInfo.storage, 'minio-s3');
 
-        // Kiểm tra: MinIO có object <id>.zkv, còn SQLite không chứa bytes bản mã
+        // Kiểm tra: MinIO có object <id>.zkv, còn SQLite chỉ chứa metadata (không có cột body)
         assert.equal(objects.has(`zk-vault/${v1.id}.zkv`), true);
-        const sqliteRow = s.vault.db.prepare('SELECT body FROM secrets WHERE id = ?').get(v1.id);
-        assert.equal(sqliteRow.body.byteLength, 0);
+        const sqliteRow = s.vault.db.prepare('SELECT * FROM secrets WHERE id = ?').get(v1.id);
+        assert.deepEqual(Object.keys(sqliteRow), ['id', 'created_at', 'expires_at']);
+        assert.equal(sqliteRow.id, v1.id);
 
         // 2. GET tải về và giải mã lại đúng cả text lẫn file
         const down = await fetch(s.base + '/api/secret', { headers: auth(v1.authKeyB64) });
@@ -433,5 +460,46 @@ test('MinIO S3 (AWS4-HMAC-SHA256): lưu, đọc, sửa và xoá tệp đính kè
     } finally {
         await s.close();
         await new Promise((r) => mockMinio.close(r));
+    }
+});
+
+test('createServer bắt buộc phải có cấu hình S3/MinIO (không fallback SQLite BLOB)', () => {
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zkv-nos3-'));
+    try {
+        assert.throws(() => createServer({ dataDir }), /MinIO S3/);
+    } finally {
+        fs.rmSync(dataDir, { recursive: true, force: true });
+    }
+});
+
+test('tự động di trú database cũ có cột body BLOB sang schema Hybrid chỉ giữ metadata', async () => {
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zkv-migrate-'));
+    const dbPath = path.join(dataDir, 'vault.db');
+    const oldDb = new DatabaseSync(dbPath);
+    oldDb.exec(`
+        CREATE TABLE secrets (
+            id TEXT PRIMARY KEY,
+            body BLOB NOT NULL,
+            created_at INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL
+        );
+    `);
+    const future = Date.now() + 3600_000;
+    // Một dòng cũ kiểu MinIO (body rỗng) và một dòng cũ kiểu SQLite BLOB (body > 0)
+    oldDb.prepare('INSERT INTO secrets VALUES (?, ?, ?, ?)').run('minio-row', Buffer.alloc(0), 1000, future);
+    oldDb.prepare('INSERT INTO secrets VALUES (?, ?, ?, ?)').run('blob-row', Buffer.from('old-blob'), 1000, future);
+    oldDb.close();
+
+    const s3 = createMemoryS3();
+    const vault = createServer({ dataDir, s3 });
+    try {
+        const cols = vault.db.prepare('PRAGMA table_info(secrets)').all().map((c) => c.name);
+        assert.deepEqual(cols, ['id', 'created_at', 'expires_at']);
+
+        const rows = vault.db.prepare('SELECT id FROM secrets').all();
+        assert.deepEqual(rows.map((r) => r.id), ['minio-row']);
+    } finally {
+        await new Promise((r) => vault.server.close(r));
+        fs.rmSync(dataDir, { recursive: true, force: true });
     }
 });

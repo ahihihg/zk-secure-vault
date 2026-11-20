@@ -15,9 +15,9 @@ Authorization: Bearer <authKey Base64URL, 43 ký tự>
 
 | Method | Đường dẫn | Body | Trả về |
 |---|---|---|---|
-| `POST` | `/api/secret` | gói tin nhị phân (13 + n + 16 byte) | `201` + JSON |
+| `POST` | `/api/secret` | gói tin nhị phân v1 hoặc v2 (29 byte – 25 MB) | `201` + JSON |
 | `GET` | `/api/secret` | — | `200` + bytes gói tin |
-| `PUT` | `/api/secret` | gói tin nhị phân mới (13 + n + 16 byte) | `200` + JSON |
+| `PUT` | `/api/secret` | gói tin nhị phân mới v1 hoặc v2 (29 byte – 25 MB) | `200` + JSON |
 | `DELETE` | `/api/secret` | — | `200` + JSON |
 | `GET` | `/api/health` | — | `200` + JSON |
 
@@ -39,16 +39,17 @@ Lưu một gói tin. Server băm `authKey` để ra `id` rồi ghi đè nếu `i
   "ok": true,
   "id": "110ceb4b4b5810c5fe78756e32c6f7a5",
   "size": 49,
-  "expiresAt": 1763513021000
+  "expiresAt": 1763513021000,
+  "storage": "minio-s3"
 }
 ```
 
-`expiresAt` là mốc thời gian Unix (mili giây).
+`expiresAt` là mốc thời gian Unix (mili giây). Bản mã luôn được lưu trên MinIO S3 (`<id>.zkv`), còn SQLite chỉ giữ metadata (`id`, `created_at`, `expires_at`).
 
 **Giới hạn**
 
-- Tối đa **64 KB** mỗi lần gửi (`maxBytes` trong [src/server.js:30](../src/server.js#L30)).
-- Tối đa **20 lượt POST / phút / IP**.
+- Tối đa **25 MB** mỗi lần gửi (`maxBytes` trong [src/server.js:33](../src/server.js#L33)) — đủ chứa văn bản + tệp đính kèm ≤ 20 MB.
+- Tối đa **20 lượt ghi (`POST`/`PUT`/`DELETE`) / phút / IP**.
 - TTL cố định 7 ngày, đặt trong `DEFAULTS.ttlSeconds`.
 
 ## GET /api/secret
@@ -88,7 +89,7 @@ Client tự mã hoá lại bằng cùng `rootKey` với **IV 12 byte ngẫu nhi�
   "id": "110ceb4b4b5810c5fe78756e32c6f7a5",
   "size": 62,
   "expiresAt": 1763513621000,
-  "storage": "sqlite"
+  "storage": "minio-s3"
 }
 ```
 
@@ -126,7 +127,7 @@ Xoá ngay văn bản gắn với key khỏi server (xoá cả bản ghi SQLite v
 ## GET /api/health
 
 ```json
-{ "ok": true, "service": "zk-vault", "time": 1762900000000 }
+{ "ok": true, "service": "zk-vault", "storage": "minio-s3", "time": 1762900000000 }
 ```
 
 ## Mã lỗi
@@ -134,11 +135,12 @@ Xoá ngay văn bản gắn với key khỏi server (xoá cả bản ghi SQLite v
 | HTTP | `error` | Khi nào |
 |---|---|---|
 | `400` | `BAD_CONTAINER` | body ngắn hơn 29 byte |
+| `401` | `UNAUTHORIZED` | thiếu/sai header `Authorization: Bearer …` hoặc `authKey` không hợp lệ |
 | `403` | `FORBIDDEN` | đường dẫn thoát khỏi thư mục public |
 | `404` | `NOT_FOUND` | không có `id` này |
 | `404` | `EXPIRED` | có nhưng đã quá hạn |
 | `405` | `METHOD_NOT_ALLOWED` | dùng phương thức khác |
-| `413` | `PAYLOAD_TOO_LARGE` | body vượt 64 KB |
+| `413` | `PAYLOAD_TOO_LARGE` | body vượt 25 MB |
 | `429` | `RATE_LIMITED` | vượt hạn mức mỗi phút |
 | `500` | `INTERNAL` | lỗi không lường trước |
 

@@ -7,8 +7,8 @@ node --test test/keycode.test.js test/crypto.test.js test/server.test.js
 ```
 
 ```
-ℹ tests 48
-ℹ pass 48
+ℹ tests 50
+ℹ pass 50
 ℹ fail 0
 ```
 
@@ -18,8 +18,8 @@ Và kiểm thử end-to-end trên trình duyệt thật:
 node test/e2e.cjs       # cần Chrome hoặc Edge
 ```
 
-`e2e.cjs` tự bật một server tạm trên cổng ngẫu nhiên, mở Chrome headless, thao tác như
-người dùng (gõ text, bấm gửi, dán key ở tab khác, sửa nội dung theo key, xoá văn bản theo key) rồi chụp ảnh vào `docs/`.
+`e2e.cjs` (16 kiểm tra) tự bật một server tạm trên cổng ngẫu nhiên, mở Chrome headless, thao tác như
+người dùng (gõ text, bấm gửi, dán key ở tab khác, sửa nội dung theo key, xoá văn bản theo key, thử key sai) rồi chụp ảnh vào `docs/`.
 
 ## Ba nhóm test
 
@@ -39,7 +39,7 @@ Kiểm tra cách key được sinh và đọc lại.
 | `isValid` | không ném exception ra ngoài |
 | key sai độ dài | `encode` từ chối |
 
-### `test/crypto.test.js` — 19 test
+### `test/crypto.test.js` — 21 test
 
 | Nhóm | Test | Bảo vệ điều gì |
 |---|---|---|
@@ -47,26 +47,29 @@ Kiểm tra cách key được sinh và đọc lại.
 | | tất định | cùng key luôn ra cùng `id` |
 | | key khác → `id` khác | không đụng nhau |
 | | `id` chỉ 16 byte | không thể dựng lại `authKey` |
-| Mã hoá | roundtrip ngắn / Unicode / 2 KB / xuống dòng | dữ liệu không bị biến dạng |
-| Định dạng | `1 + 12 + n + 16` | đúng đặc tả ở tài liệu 02 |
+| | key sai kích thước | bị từ chối với `BAD_KEY` |
+| Mã hoá v1 | roundtrip ngắn / Unicode / 2 KB / xuống dòng | dữ liệu không bị biến dạng |
+| Định dạng v1 | `1 + 12 + n + 16` | đúng đặc tả ở tài liệu 02 |
 | | IV khác nhau mỗi lần | không tái sử dụng nonce |
 | | bản mã không chứa văn bản gốc | kiểm chứng "server không đọc được" |
 | Chống can thiệp | sai key | `AUTH_FAILED` |
 | | sửa bản mã / IV / tag | `AUTH_FAILED` |
 | | đổi version | `BAD_VERSION` |
 | | cắt bớt / dữ liệu rác | lỗi rõ ràng, không trả rác |
+| Gói tin v2 (tệp) | `encryptPayload` / `decryptPayload` với PDF | giữ nguyên text, tên tệp, MIME, bytes; không rò rỉ tên/MIME trong bản mã |
+| | tương thích ngược gói v1 | `decryptPayload` vẫn đọc được gói v1 chỉ chứa văn bản |
 
-### `test/server.test.js` — 16 test
+### `test/server.test.js` — 18 test
 
 | Test | Bảo vệ điều gì |
 |---|---|
-| health check | server sống |
+| health check | server sống, báo `storage: "minio-s3"` |
 | gửi rồi lấy lại | dữ liệu nhị phân không bị biến dạng |
 | đi trọn vòng A→B | máy B chỉ có key vẫn mở được |
-| server không đọc được nội dung | bảng `secrets` chỉ có `id` và `body` |
+| server không đọc được nội dung | SQLite chỉ có `(id, created_at, expires_at)`, S3 chỉ chứa bản mã |
 | key khác → 404 | không có oracle để dò |
 | thiếu Authorization → 401 | không ai gọi được khi chưa chứng minh |
-| hết hạn TTL | dữ liệu bị xoá thật khỏi DB |
+| hết hạn TTL | dữ liệu bị xoá thật khỏi cả SQLite lẫn S3 |
 | quá giới hạn → 413 | chống làm đầy ổ đĩa |
 | gói tin quá ngắn → 400 | dữ liệu rác bị chặn sớm |
 | rate limit | 3 lượt đầu 201, sau đó 429 |
@@ -76,50 +79,36 @@ Kiểm tra cách key được sinh và đọc lại.
 | `PUT /api/secret` sửa theo key | cập nhật bản mã với IV mới, giữ nguyên key; key không tồn tại → 404 |
 | `DELETE /api/secret` xoá theo key | xoá khỏi server; đọc hoặc xoá lại lần 2 đều trả 404 |
 | MinIO S3 (SigV4) | lưu, đọc và xoá gói tin mã hoá trên S3 bucket |
+| bắt buộc có S3 | `createServer()` báo lỗi rõ nếu thiếu `s3` (không fallback SQLite BLOB) |
+| tự động di trú DB cũ | bảng `secrets` cũ có cột `body BLOB` được chuyển sang schema Hybrid 3 cột |
 
-Mỗi test đều chạy trên **thư mục dữ liệu tạm** và **cổng ngẫu nhiên**, nên chạy song song
-hay chạy lại nhiều lần đều không ảnh hưởng `data/` thật.
+Mỗi test đều chạy trên **thư mục dữ liệu tạm**, **cổng ngẫu nhiên** và một S3 giả lập trong RAM (riêng test SigV4 dựng Mock MinIO HTTP thật), nên chạy nhanh và không cần mở Docker.
 
 ## Tự tay kiểm chứng (làm được trong 3 phút)
 
 ### 1. Server không đọc được nội dung
 
 ```bash
-node src/server.js          # terminal 1
+node src/server.js          # terminal 1 (tự động bật Docker MinIO nếu chưa chạy)
 ```
 
-Mở http://127.0.0.1:8787, gửi thử một đoạn text, rồi ở terminal khác:
+Mở http://127.0.0.1:8787, gửi thử một đoạn text (hoặc tệp), rồi ở terminal khác kiểm tra SQLite:
 
 ```bash
 node -e "
 const {DatabaseSync} = require('node:sqlite');
 const db = new DatabaseSync('data/vault.db');
-for (const r of db.prepare('SELECT id, length(body) AS n, body FROM secrets').all()) {
-  console.log('id :', r.id);
-  console.log('dài:', r.n, 'byte');
-  console.log('nội dung lưu trong DB:', Buffer.from(r.body).toString('latin1').slice(0, 60));
+for (const r of db.prepare('SELECT id, created_at, expires_at FROM secrets').all()) {
+  console.log(r);
 }
 "
 ```
 
-Bạn sẽ thấy `id` là chuỗi hex vô nghĩa và `body` là ký tự rác. Không có cột nào chứa key.
+Bạn sẽ thấy SQLite chỉ chứa `id` (hex 32 ký tự) và 2 mốc thời gian — không có cột `body`, không có cột key. Còn khi mở MinIO Console (`http://127.0.0.1:9001`, bucket `zk-vault`), bạn sẽ chỉ thấy object `<id>.zkv` chứa byte mã hoá, hoàn toàn không có tên tệp gốc hay nội dung đọc được.
 
-### 2. Sửa một byte trong database thì không mở được
+### 2. Sửa một byte trên bản mã thì không mở được
 
-```bash
-node -e "
-const {DatabaseSync} = require('node:sqlite');
-const db = new DatabaseSync('data/vault.db');
-const r = db.prepare('SELECT id, body FROM secrets').get();
-const b = Buffer.from(r.body);
-b[20] ^= 1;                       // đảo 1 bit trong phần bản mã
-db.prepare('UPDATE secrets SET body = ? WHERE id = ?').run(b, r.id);
-console.log('đã sửa 1 bit của', r.id);
-"
-```
-
-Mở lại đúng key đó trên trình duyệt → *"Sai key hoặc dữ liệu đã bị thay đổi (thẻ xác thực
-không khớp)."* Đây là GHASH đang làm việc.
+Tải file `<id>.zkv` từ MinIO (hoặc dùng `test/crypto.test.js`), sửa 1 bit bất kỳ trong phần bản mã rồi ghi đè lại object trên MinIO. Khi mở lại đúng key đó trên trình duyệt → *"Sai key hoặc dữ liệu đã bị thay đổi (thẻ xác thực không khớp)."* Đây là thẻ GHASH 128-bit đang làm việc.
 
 ### 3. Key sai định dạng bị bắt trước khi gửi request
 

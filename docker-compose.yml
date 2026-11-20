@@ -1,6 +1,8 @@
 services:
   minio:
-    image: minio/minio:latest
+    # MinIO đã gỡ image chính thức minio/minio trên Docker Hub;
+    # dùng bản build cộng đồng tương thích 100% (giữ đầy đủ S3 API + Web Console).
+    image: pgsty/minio:latest
     container_name: zk-vault-minio
     ports:
       - "9000:9000"   # Cổng S3 API (Node.js server gọi vào đây)
@@ -12,8 +14,3 @@ services:
     volumes:
       - ./data/minio:/data
     restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
-      interval: 10s
-      timeout: 5s
-      retries: 3

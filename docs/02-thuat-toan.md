@@ -49,7 +49,7 @@ id      = SHA-256("zkv1/id" ‖ authKey)[0..15]
 Vì `info` được đưa vào HMAC, biết `encKey` không cho phép tính `authKey` (phải làm lại
 HMAC với khoá `PRK`, mà `PRK` chưa bao giờ lộ).
 
-Mã nguồn: [src/crypto.js:171](../src/crypto.js#L171) — hàm `deriveKeys()`.
+Mã nguồn: [src/crypto.js:172](../src/crypto.js#L172) — hàm `deriveKeys()`.
 
 ## Bước 3 — id để server tra cứu
 
@@ -88,28 +88,52 @@ Ba tham số quan trọng:
 | Tham số | Giá trị ở đây | Vì sao |
 |---|---|---|
 | **IV** | 12 byte ngẫu nhiên **mỗi lần** | Dùng lại IV với cùng khoá sẽ làm lộ XOR hai bản rõ và phá luôn khoá xác thực. 12 byte là kích thước GCM tối ưu (96 bit). |
-| **AAD** | 1 byte version (`0x01`) | Dữ liệu được xác thực nhưng không mã hoá. Nhờ đó không thể đổi phiên bản định dạng mà không làm hỏng thẻ. |
+| **AAD** | 1 byte version (`0x01` cho v1, `0x02` cho v2) | Dữ liệu được xác thực nhưng không mã hoá. Nhờ đó không thể đổi phiên bản định dạng mà không làm hỏng thẻ. |
 | **tagLength** | 128 bit (16 byte) | Cắt ngắn thẻ làm giảm độ an toàn theo cấp số nhân; 128 bit là chuẩn. |
 
 Vì sao IV cũng chống được sửa đổi: IV là đầu vào khi tính thẻ (qua `J0 = IV ‖ 0³¹1`). Đổi
 IV thì thẻ không còn khớp.
 
-Mã nguồn: [src/crypto.js:226](../src/crypto.js#L226) — `encryptText()`,
-[src/crypto.js:260](../src/crypto.js#L260) — `decryptText()`.
+Mã nguồn: [src/crypto.js:227](../src/crypto.js#L227) — `encryptText()`,
+[src/crypto.js:261](../src/crypto.js#L261) — `decryptText()`,
+[src/crypto.js:316](../src/crypto.js#L316) — `encryptPayload()`,
+[src/crypto.js:373](../src/crypto.js#L373) — `decryptPayload()`.
 
 ## Bước 5 — Định dạng gói tin
 
-Khi lưu và truyền, ta cần biết IV để giải mã, nên gói tin gồm ba phần:
+Hệ thống hỗ trợ **hai phiên bản gói tin** (phân biệt bằng byte đầu tiên):
+
+### Phiên bản 1 (`0x01`) — Chỉ văn bản (`encryptText`)
 
 ```
  offset  kích thước        nội dung
  ──────  ──────────        ─────────────────────────────
-   0         1             version = 0x01
+   0         1             version = 0x01 (AAD = [0x01])
    1        12             IV (nonce)
-  13     n + 16            bản mã (n byte) ‖ tag (16 byte)
+  13     n + 16            bản mã (n byte UTF-8) ‖ tag (16 byte)
 ```
 
 Tổng kích thước = `13 + độ dài UTF-8 của văn bản + 16`.
+
+### Phiên bản 2 (`0x02`) — Văn bản + Tệp đính kèm (`encryptPayload`)
+
+Để **mã hoá kín cả tên tệp, MIME type và dữ liệu tệp** (server và MinIO không biết định dạng hay tên tệp), trình duyệt đóng gói plaintext trước khi đưa vào AES-256-GCM:
+
+```
+Plaintext v2:
++-------------------+----------------------------------------------------+---------------------+
+| metaLen (4B BE)   | JSON UTF-8: { text, file: { name, type, size } }   | Bytes gốc của tệp   |
++-------------------+----------------------------------------------------+---------------------+
+
+Container v2 sau khi mã hoá (AAD = [0x02]):
+ offset  kích thước        nội dung
+ ──────  ──────────        ─────────────────────────────
+   0         1             version = 0x02
+   1        12             IV (nonce)
+  13     m + 16            bản mã của Plaintext v2 (m byte) ‖ tag (16 byte)
+```
+
+Khi giải mã, `decryptPayload()` đọc byte đầu tiên (`container[0]`): nếu là `0x01` sẽ tự động chuyển về `decryptText()` để **tương thích ngược** hoàn toàn với gói tin v1.
 
 ## Ví dụ số thật
 
@@ -166,8 +190,20 @@ Bảng chữ cái `A–Z a–z 0–9 - _`, bỏ dấu `=` đệm. 32 byte cho ra
 khác, và máy chủ trả `404`. Đây là đánh đổi có chủ ý: lấy key ngắn hơn 13 ký tự và
 bớt một thuật toán.
 
-Mã nguồn: [src/keycode.js:113](../src/keycode.js#L113) — `encode()`,
-[src/keycode.js:139](../src/keycode.js#L139) — `decode()`.
+Mã nguồn: [src/keycode.js:115](../src/keycode.js#L115) — `encode()`,
+[src/keycode.js:141](../src/keycode.js#L141) — `decode()`.
+
+## Bước 7 — Ký request S3 bằng AWS Signature Version 4 (Server ↔ MinIO)
+
+Khi server kết nối tới MinIO Object Storage ([src/s3.js](../src/s3.js#L57)), mọi thao tác `HEAD` / `PUT` / `GET` / `DELETE` lên bucket đều được ký bằng chuẩn **AWS4-HMAC-SHA256** (không dùng SDK ngoài):
+
+1. Băm nội dung gửi đi bằng `SHA-256` → gắn header `x-amz-content-sha256`.
+2. Tạo `CanonicalRequest` và `StringToSign`.
+3. Dẫn xuất khoá ký 4 bậc bằng `HMAC-SHA256`:
+   `kDate → kRegion → kService ("s3") → kSigning ("aws4_request")`.
+4. Tính chữ ký `HMAC-SHA256(kSigning, StringToSign)` và gửi trong header `Authorization`.
+
+> Lưu ý: AWS Signature v4 chỉ dùng để xác thực giữa **Node.js Server và MinIO** — không liên quan đến `encKey` của người dùng. MinIO vẫn chỉ nhận và giữ đúng bản mã `<id>.zkv`.
 
 ## Những gì KHÔNG làm
 

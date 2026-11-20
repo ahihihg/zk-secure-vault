@@ -1,13 +1,15 @@
 /*!
- * server.js — nhận, giữ và trả lại bản mã. Không có khả năng đọc nội dung.
+ * server.js — nhận, giữ và trả lại bản mã theo mô hình Hybrid toàn thời gian:
+ *   - SQLite (data/vault.db) : chỉ lưu metadata (id, created_at, expires_at)
+ *   - MinIO S3 (bucket)      : lưu 100% gói bản mã (<id>.zkv)
  *
- *   node src/server.js         →  http://127.0.0.1:8787
+ *   node src/server.js         →  tự bật MinIO (docker compose up -d) + chạy http://127.0.0.1:8787
  *   PORT=9000 node src/server.js
  *
  * Server này cố tình "ngố": nó chỉ biết
  *   - một chuỗi hex gọi là `id` (do client tính ra từ key)
- *   - một cục byte đã mã hoá
- *   - thời điểm hết hạn
+ *   - một cục byte đã mã hoá (lưu thành <id>.zkv trên MinIO)
+ *   - thời điểm hết hạn (lưu trong SQLite)
  * Nó không có bảng user, không có mật khẩu, không có `encKey`, không log nội dung.
  *
  * API
@@ -24,6 +26,7 @@ const fs = require('node:fs');
 const fsp = require('node:fs/promises');
 const path = require('node:path');
 const crypto = require('node:crypto');
+const { execFileSync } = require('node:child_process');
 const { DatabaseSync } = require('node:sqlite');
 const { createS3Client } = require('./s3.js');
 
@@ -72,7 +75,14 @@ function createServer(options = {}) {
     const dataDir = cfg.dataDir || path.join(__dirname, '..', 'data');
     const publicDir = cfg.publicDir || path.join(__dirname, '..', 'public');
     const now = cfg.now || (() => Date.now());
-    const s3 = cfg.s3 || null; // khi có kết nối MinIO S3, bản mã lưu trên bucket MinIO dưới tên <id>.zkv
+    const s3 = cfg.s3;
+
+    if (!s3) {
+        throw new Error(
+            'Thiếu cấu hình lưu trữ MinIO S3 (options.s3). ' +
+            'ZK-Vault chạy bắt buộc theo mô hình Hybrid: SQLite (metadata) + MinIO S3 (bản mã).'
+        );
+    }
 
     fs.mkdirSync(dataDir, { recursive: true });
 
@@ -81,17 +91,35 @@ function createServer(options = {}) {
         PRAGMA journal_mode = WAL;
         CREATE TABLE IF NOT EXISTS secrets (
             id          TEXT PRIMARY KEY,
-            body        BLOB NOT NULL,
             created_at  INTEGER NOT NULL,
             expires_at  INTEGER NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_secrets_expires ON secrets(expires_at);
     `);
 
-    const qGet = db.prepare('SELECT body, expires_at FROM secrets WHERE id = ?');
+    // Tự động di trú bảng cũ nếu database từng có cột `body BLOB`
+    const cols = db.prepare('PRAGMA table_info(secrets)').all();
+    if (cols.some((c) => c.name === 'body')) {
+        db.exec(`
+            BEGIN;
+            CREATE TABLE secrets_migrated (
+                id          TEXT PRIMARY KEY,
+                created_at  INTEGER NOT NULL,
+                expires_at  INTEGER NOT NULL
+            );
+            INSERT INTO secrets_migrated (id, created_at, expires_at)
+                SELECT id, created_at, expires_at FROM secrets WHERE length(body) = 0;
+            DROP TABLE secrets;
+            ALTER TABLE secrets_migrated RENAME TO secrets;
+            CREATE INDEX IF NOT EXISTS idx_secrets_expires ON secrets(expires_at);
+            COMMIT;
+        `);
+    }
+
+    const qGet = db.prepare('SELECT expires_at FROM secrets WHERE id = ?');
     const qPut = db.prepare(`
-        INSERT INTO secrets (id, body, created_at, expires_at) VALUES (?, ?, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET body = excluded.body, expires_at = excluded.expires_at
+        INSERT INTO secrets (id, created_at, expires_at) VALUES (?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET expires_at = excluded.expires_at
     `);
     const qDel = db.prepare('DELETE FROM secrets WHERE id = ?');
     const qExpired = db.prepare('SELECT id FROM secrets WHERE expires_at <= ?');
@@ -166,7 +194,7 @@ function createServer(options = {}) {
         const rows = qExpired.all(now());
         for (const row of rows) {
             qDel.run(row.id);
-            if (s3) s3.deleteObject(row.id + '.zkv').catch(() => {});
+            s3.deleteObject(row.id + '.zkv').catch(() => {});
         }
         return rows.length;
     }
@@ -239,19 +267,15 @@ function createServer(options = {}) {
         const createdAt = now();
         const expiresAt = createdAt + cfg.ttlSeconds * 1000;
 
-        if (s3) {
-            await s3.putObject(id + '.zkv', body);
-            qPut.run(id, Buffer.alloc(0), createdAt, expiresAt);
-        } else {
-            qPut.run(id, body, createdAt, expiresAt);
-        }
+        await s3.putObject(id + '.zkv', body);
+        qPut.run(id, createdAt, expiresAt);
 
         return json(res, 201, {
             ok: true,
             id,
             size: body.length,
             expiresAt,
-            storage: s3 ? 'minio-s3' : 'sqlite'
+            storage: 'minio-s3'
         });
     }
 
@@ -271,18 +295,14 @@ function createServer(options = {}) {
         }
         if (row.expires_at <= now()) {
             qDel.run(id);
-            if (s3) await s3.deleteObject(id + '.zkv').catch(() => {});
+            await s3.deleteObject(id + '.zkv').catch(() => {});
             return fail(res, 404, 'EXPIRED', 'Văn bản đã hết hạn và bị xoá khỏi server.');
         }
 
-        let body = Buffer.from(row.body);
-        if (s3 && body.length === 0) {
-            const s3Data = await s3.getObject(id + '.zkv');
-            if (!s3Data) {
-                qDel.run(id);
-                return fail(res, 404, 'NOT_FOUND', 'Không tìm thấy gói bản mã trên MinIO.');
-            }
-            body = s3Data;
+        const body = await s3.getObject(id + '.zkv');
+        if (!body) {
+            qDel.run(id);
+            return fail(res, 404, 'NOT_FOUND', 'Không tìm thấy gói bản mã trên MinIO.');
         }
 
         res.writeHead(200, {
@@ -312,7 +332,7 @@ function createServer(options = {}) {
         }
         if (row.expires_at <= now()) {
             qDel.run(id);
-            if (s3) await s3.deleteObject(id + '.zkv').catch(() => {});
+            await s3.deleteObject(id + '.zkv').catch(() => {});
             return fail(res, 404, 'EXPIRED', 'Văn bản đã hết hạn và bị xoá khỏi server.');
         }
 
@@ -339,19 +359,15 @@ function createServer(options = {}) {
         const updatedAt = now();
         const expiresAt = updatedAt + cfg.ttlSeconds * 1000;
 
-        if (s3) {
-            await s3.putObject(id + '.zkv', body);
-            qPut.run(id, Buffer.alloc(0), updatedAt, expiresAt);
-        } else {
-            qPut.run(id, body, updatedAt, expiresAt);
-        }
+        await s3.putObject(id + '.zkv', body);
+        qPut.run(id, updatedAt, expiresAt);
 
         return json(res, 200, {
             ok: true,
             id,
             size: body.length,
             expiresAt,
-            storage: s3 ? 'minio-s3' : 'sqlite'
+            storage: 'minio-s3'
         });
     }
 
@@ -371,11 +387,11 @@ function createServer(options = {}) {
         }
         if (row.expires_at <= now()) {
             qDel.run(id);
-            if (s3) await s3.deleteObject(id + '.zkv').catch(() => {});
+            await s3.deleteObject(id + '.zkv').catch(() => {});
             return fail(res, 404, 'EXPIRED', 'Văn bản đã hết hạn và bị xoá khỏi server.');
         }
 
-        if (s3) await s3.deleteObject(id + '.zkv');
+        await s3.deleteObject(id + '.zkv');
         qDel.run(id);
         return json(res, 200, { ok: true, id });
     }
@@ -429,7 +445,7 @@ function createServer(options = {}) {
                 return json(res, 200, {
                     ok: true,
                     service: 'zk-vault',
-                    storage: s3 ? 'minio-s3' : 'sqlite',
+                    storage: 'minio-s3',
                     time: now()
                 });
             }
@@ -471,31 +487,77 @@ function createServer(options = {}) {
 
 /* ------------------------------------------------------------------ */
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Đảm bảo MinIO S3 đang chạy và bucket đã sẵn sàng.
+ * Nếu chưa kết nối được và AUTO_START_MINIO !== '0', tự động chạy `docker compose up -d`
+ * rồi chờ MinIO khởi động xong (tối đa 20 giây).
+ */
+async function ensureMinioReady(s3Client) {
+    try {
+        await s3Client.ensureBucket();
+        return;
+    } catch (firstErr) {
+        if (process.env.AUTO_START_MINIO === '0') {
+            throw new Error(
+                'Không kết nối được MinIO tại ' + s3Client.cfg.endpoint + ': ' + firstErr.message
+            );
+        }
+    }
+
+    const projectRoot = path.join(__dirname, '..');
+    console.log('MinIO chưa chạy — đang tự động khởi động bằng "docker compose up -d"...');
+
+    try {
+        execFileSync('docker', ['compose', 'up', '-d'], {
+            cwd: projectRoot,
+            stdio: 'inherit'
+        });
+    } catch (err) {
+        throw new Error(
+            'Không thể chạy "docker compose up -d". Hãy chắc chắn Docker Desktop đang mở.\n' +
+            'Chi tiết: ' + err.message
+        );
+    }
+
+    const deadline = Date.now() + 20_000;
+    let lastErr = null;
+    while (Date.now() < deadline) {
+        try {
+            await s3Client.ensureBucket();
+            return;
+        } catch (err) {
+            lastErr = err;
+            await sleep(500);
+        }
+    }
+
+    throw new Error(
+        'Đã chạy Docker nhưng MinIO tại ' + s3Client.cfg.endpoint + ' chưa sẵn sàng sau 20 giây: ' +
+        (lastErr ? lastErr.message : 'timeout')
+    );
+}
+
 if (require.main === module) {
     (async () => {
-        let activeS3 = null;
-        if (process.env.USE_MINIO !== '0') {
-            const candidate = createS3Client();
-            try {
-                await candidate.ensureBucket();
-                activeS3 = candidate;
-            } catch {
-                activeS3 = null;
-            }
+        const s3Client = createS3Client();
+        try {
+            await ensureMinioReady(s3Client);
+        } catch (err) {
+            console.error('[LỖI KHỞI ĐỘNG MINIO]', err.message);
+            process.exit(1);
         }
 
-        const { server, cfg, dataDir } = createServer({ s3: activeS3 });
+        const { server, cfg, dataDir } = createServer({ s3: s3Client });
         server.listen(cfg.port, cfg.host, () => {
             console.log('ZK-Vault chạy tại http://' + cfg.host + ':' + cfg.port);
             console.log('  giới hạn : ' + Math.round(cfg.maxBytes / (1024 * 1024)) + ' MB / lần gửi');
             console.log('  TTL      : ' + Math.round(cfg.ttlSeconds / 86400) + ' ngày');
-            if (activeS3) {
-                console.log('  lưu trữ  : MinIO S3 (' + activeS3.cfg.endpoint + ' / bucket: ' + activeS3.cfg.bucket + ')');
-            } else {
-                console.log('  lưu trữ  : SQLite cục bộ (' + dataDir + ') — bật Docker MinIO ("docker compose up -d") để lưu trên S3');
-            }
+            console.log('  metadata : SQLite (' + path.join(dataDir, 'vault.db') + ')');
+            console.log('  bản mã   : MinIO S3 (' + s3Client.cfg.endpoint + ' / bucket: ' + s3Client.cfg.bucket + ')');
         });
     })();
 }
 
-module.exports = { createServer };
+module.exports = { createServer, ensureMinioReady };

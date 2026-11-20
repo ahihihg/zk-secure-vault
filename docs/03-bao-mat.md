@@ -25,7 +25,7 @@ Ba điều kiện tạo nên tính chất đó:
 
 | Tấn công | Kết quả | Cơ chế chặn |
 |---|---|---|
-| A/B đọc `vault.db` | Chỉ thấy `id` (hex), bản mã, mốc thời gian | Không có `encKey` ở bất kỳ đâu |
+| A/B đọc `vault.db` hoặc bucket MinIO | Chỉ thấy `id` (hex), bản mã (hoặc `<id>.zkv`), mốc thời gian; không thấy tên tệp hay MIME type | Không có `encKey` ở bất kỳ đâu; tên/MIME tệp nằm bên trong bản mã v2 |
 | A đọc log | Không thấy gì thêm ngoài `id`, kích thước, IP | Server không log body, không log `Authorization` |
 | A dùng `authKey` thu được để tải bản mã | Tải được, **không giải mã được** | `authKey ≠ encKey`, và HKDF không cho phép suy ngược |
 | C đoán `authKey` | Vô vọng: 2²⁵⁶ khả năng | 256 bit + rate limit 120 GET/phút |
@@ -37,7 +37,7 @@ Ba điều kiện tạo nên tính chất đó:
 | Ghi đè / sửa / xoá bản mã của người khác | Không làm được | Server tự tính `id` từ `authKey`, không tin `id` client gửi; `PUT`/`DELETE` trả `404` nếu sai key |
 | Tái sử dụng nonce khi sửa nhiều lần cùng key | Không xảy ra | Mỗi lần `PUT`, trình duyệt gọi `getRandomValues(12 byte)` sinh IV hoàn toàn mới |
 | Chèn script để lấy key | Bị chặn | CSP `script-src 'self'`, không có script ngoài, render bằng `textContent` |
-| Gửi dồn dập làm đầy ổ đĩa | Chặn một phần | rate limit 20 POST/phút + TTL 7 ngày + 64 KB/lần |
+| Gửi dồn dập làm đầy ổ đĩa | Chặn một phần | rate limit 20 lần ghi/phút + TTL 7 ngày + giới hạn 25 MB/lần (tệp ≤ 20 MB ở client) |
 | Dò key bằng thời gian phản hồi | Không áp dụng | Không có so sánh từng byte; sai key = không tìm thấy `id` |
 
 ## Những gì hệ thống **không** bảo vệ
@@ -70,8 +70,8 @@ không cần tài khoản.
 ## Những việc cần làm nếu triển khai thật
 
 1. **Bắt buộc HTTPS** (HSTS), vì `authKey` đi qua header mỗi request.
-2. **Chặn giới hạn ở server**, không chỉ ở client: hiện 200 từ chỉ được kiểm tra trong
-   trình duyệt, còn server nhận tới 64 KB.
+2. **Chặn giới hạn ở server**, không chỉ ở client: hiện giới hạn 200 từ và tệp 20 MB được kiểm tra trong
+   trình duyệt, còn server chặn theo tổng dung lượng gói tin ở mức **25 MB**.
 3. **CAPTCHA hoặc proof-of-work** chống lạm dụng upload ẩn danh — đây chính là lý do
    Firefox Send phải đóng cửa năm 2020.
 4. **Backup có mã hoá** cho `vault.db`, và quy trình xoá dữ liệu đúng hạn.

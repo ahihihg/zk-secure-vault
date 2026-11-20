@@ -5,30 +5,33 @@ Tài liệu này dẫn bạn đi qua từng file theo đúng thứ tự nên đ�
 ## Cây file
 
 ```
-src/crypto.js     270 dòng   lõi mã hoá — đọc trước
-src/keycode.js    205 dòng   định dạng key — đọc sau
-src/server.js     370 dòng   HTTP + SQLite
-public/app.js     225 dòng   luồng giao diện
-public/index.html            2 cột: Gửi / Nhận
-public/style.css             giao diện
+src/crypto.js     462 dòng   lõi mã hoá (HKDF, AES-256-GCM, gói v1 & v2) — đọc trước
+src/keycode.js    178 dòng   định dạng key ZKV1-… (Base64URL) — đọc sau
+src/s3.js         185 dòng   client MinIO S3 thuần Node.js (AWS Signature v4)
+src/server.js     563 dòng   HTTP API + SQLite (metadata) + MinIO S3 (bản mã) + tự bật Docker MinIO
+public/app.js     506 dòng   luồng giao diện (gửi/nhận/tải tệp/sửa/xoá)
+public/index.html 119 dòng   2 cột: Gửi / Nhận
+public/style.css  410 dòng   giao diện
 ```
 
 ## Thứ tự đọc đề xuất
 
-1. `src/crypto.js` — hiểu dữ liệu được mã hoá thế nào.
+1. `src/crypto.js` — hiểu dữ liệu (văn bản và tệp đính kèm) được mã hoá thế nào.
 2. `src/keycode.js` — hiểu vì sao key trông như vậy.
-3. `src/server.js` — hiểu server làm gì (rất ít).
-4. `public/app.js` — hiểu hai luồng giao diện.
-5. Quay lại `test/*.test.js` — thấy mỗi khẳng định trong tài liệu được kiểm chứng ở đâu.
+3. `src/s3.js` — hiểu cách server ký AWS Signature v4 để nói chuyện với MinIO S3.
+4. `src/server.js` — hiểu server làm gì (rất ít, giữ nguyên zero-knowledge).
+5. `public/app.js` — hiểu toàn bộ luồng giao diện.
+6. Quay lại `test/*.test.js` và `test/e2e.cjs` — thấy mỗi khẳng định trong tài liệu được kiểm chứng ở đâu.
 
 ---
 
 ## src/crypto.js
 
-### Hằng số (dòng 39–51)
+### Hằng số (dòng 39–49)
 
 ```js
-const VERSION = 0x01;
+const VERSION = 0x01;          // gói v1: chỉ văn bản
+const VERSION_PAYLOAD = 0x02;  // gói v2: văn bản + tệp đính kèm (mã hoá cả tên/MIME)
 const KEY_BYTES = 32;
 const IV_BYTES = 12;
 const TAG_BYTES = 16;
@@ -38,7 +41,7 @@ const HEADER_BYTES = 1 + IV_BYTES;   // 13
 `HEADER_BYTES` là chỗ hay bị sửa nhầm nhất. Nó là `version + IV` vì cả hai đều nằm trước
 phần bản mã trong gói tin.
 
-### `deriveKeys(rootKey)` — [src/crypto.js:171](../src/crypto.js#L171)
+### `deriveKeys(rootKey)` — [src/crypto.js:172](../src/crypto.js#L172)
 
 Đây là hàm quan trọng nhất của dự án. Nó nhận 32 byte và trả về ba thứ:
 
@@ -61,7 +64,7 @@ nhau**. Đây là lý do lộ `authKey` không kéo theo lộ `encKey`.
 `id` được tính bằng `digest('SHA-256', "zkv1/id" ‖ authKey)` rồi lấy 16 byte đầu — xem
 dòng 208–212.
 
-### `encryptText(text, rootKey)` — [src/crypto.js:226](../src/crypto.js#L226)
+### `encryptText(text, rootKey)` — [src/crypto.js:227](../src/crypto.js#L227)
 
 Ba việc, theo thứ tự:
 
@@ -81,7 +84,7 @@ container.set(iv, 1);
 container.set(sealed, HEADER_BYTES);
 ```
 
-### `decryptText(container, rootKey)` — [src/crypto.js:260](../src/crypto.js#L260)
+### `decryptText(container, rootKey)` — [src/crypto.js:261](../src/crypto.js#L261)
 
 Thứ tự kiểm tra quan trọng:
 
@@ -92,17 +95,24 @@ Thứ tự kiểm tra quan trọng:
 Bước 3 cố tình không phân biệt "sai khoá" với "dữ liệu bị sửa", vì GCM cũng không phân
 biệt được — và việc tách hai thông báo khác nhau sẽ tạo ra một oracle nhỏ cho kẻ tấn công.
 
+### `encryptPayload(payload, rootKey)` & `decryptPayload(container, rootKey)` — [src/crypto.js:316](../src/crypto.js#L316), [373](../src/crypto.js#L373)
+
+Dùng cho gói tin **v2 (`0x02`)** chứa văn bản kèm tệp đính kèm:
+
+1. `encryptPayload()` ghép `[4 byte uint32 BE độ dài JSON] + [JSON { text, file: { name, type, size } }] + [bytes tệp]` thành 1 plaintext rồi mã hoá AES-256-GCM với `AAD = [0x02]`.
+2. `decryptPayload()` kiểm tra `raw[0]`: nếu là `0x01` thì gọi `decryptText()` và trả `{ text, file: null }` (tương thích ngược v1); nếu là `0x02` thì giải mã và tách lại `text` cùng `file: { name, type, size, data }`.
+
 ---
 
 ## src/keycode.js
 
-### `encode(bytes)` — [src/keycode.js:113](../src/keycode.js#L113)
+### `encode(bytes)` — [src/keycode.js:115](../src/keycode.js#L115)
 
 ```
 32 byte → Base64URL (43 ký tự) → gắn tiền tố → "ZKV1-…"
 ```
 
-### `decode(text)` — [src/keycode.js:139](../src/keycode.js#L139)
+### `decode(text)` — [src/keycode.js:141](../src/keycode.js#L141)
 
 Kiểm tra theo thứ tự:
 
@@ -113,7 +123,7 @@ Kiểm tra theo thứ tự:
 | ký tự ngoài bảng Base64URL | "Ký tự không hợp lệ trong key…" |
 | bit đệm ≠ 0 | "Key bị sai ở ký tự cuối (hoặc đã bị cắt cụt)…" |
 
-### `normalize(input)` — [src/keycode.js:127](../src/keycode.js#L127)
+### `normalize(input)` — [src/keycode.js:129](../src/keycode.js#L129)
 
 Chỉ làm hai việc: bỏ khoảng trắng (kể cả xuống dòng khi copy) và bỏ tiền tố `ZKV1-`.
 
@@ -123,9 +133,19 @@ như các định dạng thân thiện với người đọc khác.
 
 ---
 
+## src/s3.js
+
+Client kết nối MinIO / S3 viết thuần Node.js (không dùng AWS SDK), mặc định khớp với `docker-compose.yml` (`http://127.0.0.1:9000`, bucket `zk-vault`).
+
+- **`signRequest(method, objectKey, bodyBuffer)`** ([src/s3.js:57](../src/s3.js#L57)): cài đặt chuẩn **AWS4-HMAC-SHA256** (băm payload SHA-256, tạo Canonical Request, dẫn xuất 4 bước `kDate → kRegion → kService → kSigning`, sinh header `Authorization`).
+- **`ensureBucket()`** ([src/s3.js:119](../src/s3.js#L119)): kiểm tra `HEAD /<bucket>`, nếu `404` thì tự tạo bucket bằng `PUT`.
+- **`putObject` / `getObject` / `deleteObject`** ([src/s3.js:135](../src/s3.js#L135), [151](../src/s3.js#L151), [165](../src/s3.js#L165)): đẩy, tải và xoá bản mã `<id>.zkv` trên MinIO.
+
+---
+
 ## src/server.js
 
-### `idFromAuthKey(token)` — [src/server.js:118](../src/server.js#L118)
+### `idFromAuthKey(token)` — [src/server.js:146](../src/server.js#L146)
 
 ```js
 crypto.createHash('sha256').update('zkv1/id').update(auth).digest().subarray(0, 16)
@@ -135,50 +155,51 @@ Phải khớp **chính xác** với client ([src/crypto.js:209](../src/crypto.js
 miền `"zkv1/id"`, cùng thứ tự nối. Lệch một byte là server tính ra `id` khác và không bao
 giờ tìm thấy dữ liệu.
 
-### `handlePost` — [src/server.js:209](../src/server.js#L209)
+### `handlePost` — [src/server.js:237](../src/server.js#L237)
 
 ```
-rate limit → kiểm Authorization → đọc body (≤ maxBytes) → kiểm độ dài → ghi DB (hoặc MinIO S3)
+rate limit → kiểm Authorization → đọc body (≤ maxBytes) → kiểm độ dài → PUT MinIO (<id>.zkv) → ghi metadata SQLite
 ```
 
 Điểm cần nhớ: **không có tham số `id` từ client**. Server tự suy ra.
 
-### `handleGet` — [src/server.js:258](../src/server.js#L258)
+### `handleGet` — [src/server.js:282](../src/server.js#L282)
 
 ```
-rate limit → Authorization → id → tìm trong DB → kiểm hạn → trả bytes
+rate limit → Authorization → id → tìm metadata trong SQLite → kiểm hạn → GET <id>.zkv từ MinIO → trả bytes
 ```
 
 Ba nhánh trả về, và chúng cố tình giống nhau ở tầng HTTP (đều `404`), chỉ khác `message`:
-không tìm thấy, hết hạn, hoặc không tồn tại.
+không tìm thấy, hết hạn, hoặc không có object trên MinIO.
 
-### `handlePut` — [src/server.js:299](../src/server.js#L299)
+### `handlePut` — [src/server.js:319](../src/server.js#L319)
 
 ```
-rate limit → Authorization → id → kiểm bản ghi tồn tại & còn hạn → đọc body → kiểm độ dài → ghi đè + gia hạn TTL
+rate limit → Authorization → id → kiểm bản ghi tồn tại & còn hạn → đọc body → kiểm độ dài → ghi đè <id>.zkv trên MinIO + gia hạn TTL trong SQLite
 ```
 
 Khác với `POST`: `PUT` đòi hỏi bản ghi đã tồn tại và chưa hết hạn, nếu không trả `404`.
 Server vẫn không biết nội dung mới là gì — chỉ thay cục byte bản mã theo cùng `id`.
 
-### `handleDelete` — [src/server.js:358](../src/server.js#L358)
+### `handleDelete` — [src/server.js:374](../src/server.js#L374)
 
 ```
-rate limit → Authorization → id → kiểm tồn tại & còn hạn → xoá khỏi S3 (nếu có) & SQLite → trả 200
+rate limit → Authorization → id → kiểm tồn tại & còn hạn → xoá <id>.zkv khỏi MinIO & metadata khỏi SQLite → trả 200
 ```
 
 Xoá xong trả `{ ok: true, id }`. Nếu gọi lại lần nữa với cùng key sẽ trả `404`.
 
-### `readBody` — [src/server.js:179](../src/server.js#L179)
+### `readBody` — [src/server.js:207](../src/server.js#L207)
 
 Đọc body theo từng chunk, cộng dồn kích thước và cắt ngay khi vượt hạn mức. Chú ý: khi vượt
 giới hạn, hàm **không huỷ socket ngay** mà để router còn kịp trả `413` cho client — huỷ sớm
 thì client chỉ thấy "connection reset" thay vì một thông báo tử tế.
 
-### Router — [src/server.js:424](../src/server.js#L424)
+### Router & Tự khởi động MinIO — [src/server.js:440](../src/server.js#L440), [497](../src/server.js#L497)
 
-Rất ngắn: hai đường API (`/api/health`, `/api/secret` với `GET`/`POST`/`PUT`/`DELETE`), còn lại là file tĩnh. File tĩnh được chặn thoát thư mục bằng
-`file.startsWith(path.resolve(publicDir))` ([src/server.js:397](../src/server.js#L397)).
+- Router rất ngắn: hai đường API (`/api/health`, `/api/secret` với `GET`/`POST`/`PUT`/`DELETE`), còn lại là file tĩnh. File tĩnh được chặn thoát thư mục bằng `file.startsWith(path.resolve(publicDir))` ([src/server.js:413](../src/server.js#L413)).
+- `ensureMinioReady()` ([src/server.js:497](../src/server.js#L497)): khi chạy `node src/server.js`, tự kiểm tra MinIO; nếu chưa chạy thì tự gọi `docker compose up -d` rồi chờ tối đa 20 giây đến khi bucket `zk-vault` sẵn sàng (báo lỗi rõ và dừng nếu Docker chưa mở).
+- Bảng SQLite chỉ có 3 cột `(id, created_at, expires_at)` và có đoạn tự động di trú (migration) nếu gặp file `vault.db` cũ từng có cột `body BLOB`.
 
 ---
 
@@ -193,12 +214,18 @@ Rất ngắn: hai đường API (`/api/health`, `/api/secret` với `GET`/`POST`
 
 ```js
 const rootKey = ZKCrypto.randomKey();
-const sealed = await ZKCrypto.encryptText(text, rootKey);
+const sealed = selectedSendFile
+    ? await ZKCrypto.encryptPayload({ text, file: { name, type, data: fileBuf } }, rootKey)
+    : await ZKCrypto.encryptText(text, rootKey);
 await fetch('/api/secret', { method: 'POST', headers: { Authorization: 'Bearer ' + sealed.authKeyB64 }, body: sealed.container });
 $('keyOut').textContent = ZKKeycode.encode(rootKey);
 ```
 
-Toàn bộ luồng gửi nằm trong 4 dòng này. `rootKey` chỉ sống trong biến cục bộ.
+Nếu có tệp đính kèm (≤ 20 MB), client đọc `ArrayBuffer` và dùng gói **v2** (`encryptPayload`); nếu chỉ có văn bản thì dùng gói **v1** (`encryptText`). `rootKey` chỉ sống trong biến cục bộ.
+
+### Tải tệp sau giải mã (`#downloadFileBtn`) — [public/app.js:240](../public/app.js#L240)
+
+Tạo `Blob` từ `activeFile.data` (`Uint8Array` trên RAM), tạo URL tạm bằng `URL.createObjectURL(blob)` để kích hoạt tải xuống với đúng tên tệp gốc và tự gọi `URL.revokeObjectURL()` sau 3 giây.
 
 ### `openText(rawKey)` — [public/app.js:310](../public/app.js#L310)
 

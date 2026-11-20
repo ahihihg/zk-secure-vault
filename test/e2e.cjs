@@ -106,9 +106,18 @@ async function shot(cdp, file) {
 
 /* ----------------------------- chạy ----------------------------- */
 
+function createMemoryS3() {
+    const objects = new Map();
+    return {
+        async putObject(key, data) { objects.set(key, Buffer.from(data)); return true; },
+        async getObject(key) { return objects.has(key) ? Buffer.from(objects.get(key)) : null; },
+        async deleteObject(key) { objects.delete(key); return true; }
+    };
+}
+
 (async () => {
     const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zkv-e2e-'));
-    const vault = createServer({ dataDir });
+    const vault = createServer({ dataDir, s3: createMemoryS3() });
     await new Promise((r) => vault.server.listen(0, '127.0.0.1', r));
     const origin = 'http://127.0.0.1:' + vault.server.address().port;
 

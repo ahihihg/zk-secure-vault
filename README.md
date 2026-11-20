@@ -10,13 +10,19 @@ dán key    ──►  tìm bản mã theo key     ──►  giải mã tại t
 
 ## Chạy thử
 
+Mở Docker Desktop, sau đó chạy đúng **một lệnh duy nhất**:
+
 ```bash
 node src/server.js
-# ZK-Vault chạy tại http://127.0.0.1:8787
+# Tự động bật MinIO (docker compose up -d) nếu chưa chạy,
+# tạo bucket zk-vault và chạy ZK-Vault tại http://127.0.0.1:8787
 ```
 
 Không cần `npm install`. Server chỉ dùng module có sẵn trong Node 24:
-`node:http`, `node:sqlite`, `node:crypto`.
+`node:http`, `node:sqlite`, `node:crypto`, `node:child_process`.
+Hệ thống lưu trữ theo mô hình **Hybrid toàn thời gian**:
+- **SQLite** (`data/vault.db`): chỉ lưu metadata (`id`, `created_at`, `expires_at`).
+- **MinIO S3** (bucket `zk-vault`): lưu 100% gói bản mã (`<id>.zkv`).
 
 ![Gửi văn bản và nhận key](docs/screenshot-send.png)
 
@@ -37,9 +43,10 @@ ciphertext vô nghĩa.
 
 ```
 src/
-├── crypto.js     # lõi: HKDF dẫn xuất khoá + AES-256-GCM
+├── crypto.js     # lõi: HKDF dẫn xuất khoá + AES-256-GCM (gói v1 & v2)
 ├── keycode.js    # key ZKV1-… : Base64URL, 43 ký tự
-└── server.js     # HTTP API + SQLite, zero-dependency
+├── s3.js         # client MinIO S3 thuần Node.js (AWS Signature v4)
+└── server.js     # HTTP API + SQLite (metadata) + MinIO S3 (bản mã)
 public/
 ├── index.html    # giao diện hai cột: Gửi / Nhận
 ├── app.js        # luồng client
@@ -47,7 +54,7 @@ public/
 test/
 ├── keycode.test.js  # 11 test
 ├── crypto.test.js   # 21 test
-├── server.test.js   # 16 test
+├── server.test.js   # 18 test
 └── e2e.cjs          # 16 kiểm tra trên Chrome thật
 docs/               # tài liệu đọc hiểu dự án
 ```

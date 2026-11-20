@@ -3,19 +3,21 @@
 ## Ba thành phần
 
 ```
-┌────────────────────────┐        ┌────────────────────────┐
-│  TRÌNH DUYỆT           │        │  SERVER (Node.js)      │
-│                        │  HTTPS │                        │
-│  public/index.html     │◄──────►│  src/server.js         │
-│  public/app.js         │        │  ├─ POST   /api/secret │
-│  src/crypto.js  ───────┤        │  ├─ GET    /api/secret │
-│  src/keycode.js        │        │  ├─ PUT    /api/secret │
-│                        │        │  ├─ DELETE /api/secret │
-│  sinh key, mã hoá,     │        │  └─ file tĩnh          │
-│  giải mã — TẤT CẢ ở đây│        │                        │
-│                        │        │  SQLite: data/vault.db │
-│                        │        │  (hoặc MinIO S3)       │
-└────────────────────────┘        └────────────────────────┘
+┌────────────────────────┐        ┌───────────────────────────┐
+│  TRÌNH DUYỆT           │        │  SERVER (Node.js)         │
+│                        │  HTTPS │                           │
+│  public/index.html     │◄──────►│  src/server.js            │
+│  public/app.js         │        │  ├─ POST   /api/secret    │
+│  src/crypto.js  ───────┤        │  ├─ GET    /api/secret    │
+│  src/keycode.js        │        │  ├─ PUT    /api/secret    │
+│                        │        │  ├─ DELETE /api/secret    │
+│  sinh key, mã hoá v1/v2│        │  ├─ GET    /api/health    │
+│  giải mã — TẤT CẢ ở đây│        │  └─ file tĩnh             │
+│  (text + tệp ≤ 20 MB)  │        │                           │
+└────────────────────────┘        │  SQLite: data/vault.db    │
+                                  │  MinIO S3: src/s3.js      │
+                                  │  (object <id>.zkv, SigV4) │
+                                  └───────────────────────────┘
 ```
 
 Điểm cốt lõi: **không có thành phần nào ở giữa biết nội dung**. Server là một cái tủ có
@@ -26,19 +28,20 @@ khoá số, chỉ giữ hộp đã niêm phong và trả lại đúng cái hộp
 ```
 Người gửi                                                  Server
 ──────────────────────────────────────────────────────────────────────
-1. gõ đoạn text (≤ 200 từ)
+1. gõ đoạn text (≤ 200 từ) và/hoặc chọn tệp đính kèm (≤ 20 MB)
 2. bấm "Mã hoá & lưu"
    ├─ sinh K = 32 byte ngẫu nhiên
-   ├─ encKey = HKDF(K, "enc")
-   ├─ authKey = HKDF(K, "auth")
-   ├─ id = SHA-256("id" ‖ authKey)[0..15]
-   ├─ bản mã = AES-256-GCM(encKey, text)
+   ├─ encKey = HKDF(K, "zkv1/enc")
+   ├─ authKey = HKDF(K, "zkv1/auth")
+   ├─ id = SHA-256("zkv1/id" ‖ authKey)[0..15]
+   ├─ bản mã = AES-256-GCM(encKey, gói v1 nếu chỉ text / gói v2 nếu có tệp)
    └─ POST bản mã, header Authorization: Bearer authKey
                               ────────────────────►
                                                        3. tính lại id từ authKey
-                                                          lưu (id, bản mã, hạn)
+                                                          PUT <id>.zkv lên MinIO S3
+                                                          lưu metadata (id, created_at, expires_at) vào SQLite
                               ◄────────────────────
-                                                       { id, size, expiresAt }
+                                                       { ok, id, size, expiresAt, storage: "minio-s3" }
 4. hiện key ZKV1-… cho người dùng
 ```
 
@@ -52,16 +55,17 @@ Người nhận                                                 Server
 ──────────────────────────────────────────────────────────────────────
 1. dán key ZKV1-… vào ô
    ├─ giải Base64URL, đòi đúng 43 ký tự (sai -> báo ngay, chưa gửi request)
-   ├─ authKey = HKDF(K, "auth")
-   └─ GET /api/secret, Bearer authKey
+   ├─ authKey = HKDF(K, "zkv1/auth")
+   └─ (sau 250 ms debounce) GET /api/secret, Bearer authKey
                               ────────────────────►
                                                        2. id = SHA-256(...)
-                                                          tìm bản mã, kiểm hạn
+                                                          tìm metadata trong SQLite, kiểm hạn
+                                                          GET <id>.zkv từ MinIO S3
                               ◄────────────────────
 3. nhận bản mã
-   ├─ encKey = HKDF(K, "enc")
-   ├─ text = AES-256-GCM⁻¹(encKey, bản mã)
-   └─ hiện text
+   ├─ encKey = HKDF(K, "zkv1/enc")
+   ├─ decryptPayload(): tự nhận diện gói v1 (0x01) hoặc v2 (0x02)
+   └─ hiện văn bản gốc và/hoặc thẻ tải tệp đính kèm (tạo Blob trên RAM)
 ```
 
 ## Luồng sửa (giữ nguyên key)
@@ -69,18 +73,18 @@ Người nhận                                                 Server
 ```
 Người giữ key                                              Server
 ──────────────────────────────────────────────────────────────────────
-1. đã mở văn bản bằng key ZKV1-… → bấm "Sửa nội dung"
-2. nhập nội dung mới → bấm "Lưu thay đổi"
+1. đã mở nội dung bằng key ZKV1-… → bấm "Sửa nội dung"
+2. sửa text và/hoặc đổi/xoá tệp đính kèm → bấm "Lưu thay đổi"
    ├─ dùng lại K và encKey cũ
    ├─ sinh IV 12 byte ngẫu nhiên MỚI (không tái sử dụng nonce GCM)
-   ├─ bản mã mới = AES-256-GCM(encKey, text mới, IV mới)
+   ├─ bản mã mới = AES-256-GCM(encKey, gói v1 hoặc v2, IV mới)
    └─ PUT /api/secret, header Authorization: Bearer authKey
                               ────────────────────►
                                                        3. tính lại id từ authKey
                                                           kiểm tra bản ghi tồn tại & còn hạn
-                                                          ghi đè bản mã mới, làm mới hạn 7 ngày
+                                                          ghi đè <id>.zkv mới trên MinIO, làm mới hạn 7 ngày trong SQLite
                               ◄────────────────────
-                                                       { ok: true, id, size, expiresAt }
+                                                       { ok: true, id, size, expiresAt, storage }
 4. cập nhật hiển thị — key ZKV1-… giữ nguyên
 ```
 
@@ -98,7 +102,7 @@ Người giữ key                                              Server
                               ────────────────────►
                                                        3. tính lại id từ authKey
                                                           kiểm tra tồn tại & còn hạn
-                                                          xoá khỏi SQLite (và MinIO S3 nếu bật)
+                                                          xoá <id>.zkv khỏi MinIO S3 và metadata khỏi SQLite
                               ◄────────────────────
                                                        { ok: true, id }
 4. ẩn khung kết quả — key cũ không còn mở được nữa (trả 404)
@@ -106,14 +110,14 @@ Người giữ key                                              Server
 
 ## Ai giữ gì
 
-| Giá trị | Ai tạo | Client có | Server có | Có trong database |
+| Giá trị | Ai tạo | Client có | Server có | Có trong database / MinIO |
 |---|---|---|---|---|
 | `K` (key người dùng) | client | ✅ (trong RAM) | ❌ | ❌ |
 | `encKey` | client | ✅ | ❌ | ❌ |
 | `authKey` | client | ✅ | ✅ (qua header) | ❌ (chỉ có hash) |
-| `id` = SHA-256("id"‖authKey) | cả hai tính độc lập | ✅ | ✅ | ✅ (khoá chính) |
-| bản mã | client | ✅ | ✅ | ✅ |
-| văn bản gốc | client | chỉ khi giải mã | ❌ | ❌ |
+| `id` = SHA-256("zkv1/id"‖authKey) | cả hai tính độc lập | ✅ | ✅ | ✅ (khoá chính / tên object `<id>.zkv`) |
+| bản mã (gói v1/v2) | client | ✅ | ✅ | ✅ (chỉ trên MinIO `<id>.zkv`, SQLite không lưu BLOB) |
+| văn bản gốc, tên tệp, MIME, dữ liệu tệp | client | chỉ khi giải mã | ❌ | ❌ |
 
 ## Vì sao cần server, dù đoạn text chỉ vài trăm byte?
 
@@ -137,8 +141,8 @@ tạo (POST) ──► tồn tại (tối đa 7 ngày) ──► xoá theo key (
 ```
 
 - Hạn tính từ lúc upload (và được làm mới 7 ngày sau mỗi lần sửa `PUT`).
-- Có hàm dọn dẹp chạy mỗi 10 phút ([src/server.js:165](../src/server.js#L165)).
-- Hạn cũng được kiểm tra lúc đọc, sửa và xoá ([src/server.js:272](../src/server.js#L272), [src/server.js:313](../src/server.js#L313), [src/server.js:372](../src/server.js#L372)), nên không
+- Có hàm dọn dẹp chạy mỗi 10 phút ([src/server.js:193](../src/server.js#L193)).
+- Hạn cũng được kiểm tra lúc đọc, sửa và xoá ([src/server.js:296](../src/server.js#L296), [src/server.js:333](../src/server.js#L333), [src/server.js:388](../src/server.js#L388)), nên không
   phụ thuộc vào việc hàm dọn có chạy hay không.
 
 ## Những quyết định thiết kế và lý do
@@ -149,5 +153,5 @@ tạo (POST) ──► tồn tại (tối đa 7 ngày) ──► xoá theo key (
 | `id` suy ra từ `authKey` | Server tra cứu được mà không cần biết key; không có bảng ánh xạ "key → id" để rò rỉ |
 | Một key, nhiều nhánh HKDF | Người dùng chỉ phải giữ một chuỗi, nhưng khoá mã hoá và khoá truy cập là hai thứ độc lập |
 | Key dạng Base64URL | Ngắn (43 ký tự), cùng bảng chữ cái với header `Authorization`, đúng chuẩn RFC 4648 |
-| Dùng SQLite chứ không dùng file JSON | Cần xoá theo hạn, và BLOB tiện cho dữ liệu nhị phân |
-| Một khối GCM duy nhất | Với ≤ 200 từ (≈ 2 KB) chia khối chỉ làm code khó hiểu mà không thêm lợi ích |
+| Mô hình Hybrid toàn thời gian (SQLite + MinIO S3) | SQLite cực nhẹ chỉ giữ metadata `(id, created_at, expires_at)` để tra cứu và quét TTL; MinIO S3 giữ 100% bản mã `<id>.zkv` qua AWS Signature v4. Chạy `node src/server.js` tự động bật MinIO bằng `docker compose up -d` |
+| Một khối GCM duy nhất (v1 & v2) | Đơn giản, vừa đủ cho văn bản ≤ 200 từ và tệp đính kèm ≤ 20 MB; hỗ trợ gói v2 mã hoá kín cả tên tệp lẫn MIME type |
